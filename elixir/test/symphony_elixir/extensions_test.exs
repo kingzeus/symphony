@@ -343,7 +343,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert state_payload == %{
              "generated_at" => state_payload["generated_at"],
-             "counts" => %{"running" => 1, "retrying" => 1, "blocked" => 1},
+             "counts" => %{"running" => 1, "retrying" => 1, "blocked" => 1, "waiting" => 1},
              "running" => [
                %{
                  "issue_id" => "issue-http",
@@ -391,6 +391,17 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "last_event_at" => state_payload["blocked"] |> List.first() |> Map.fetch!("last_event_at")
                }
              ],
+             "waiting" => [
+               %{
+                 "issue_id" => "issue-waiting",
+                 "issue_identifier" => "MT-WAIT",
+                 "issue_url" => "https://example.org/issues/MT-WAIT",
+                 "state" => "Human Review",
+                 "updated_at" => state_payload["waiting"] |> List.first() |> Map.fetch!("updated_at"),
+                 "worker_host" => nil,
+                 "workspace_path" => nil
+               }
+             ],
              "codex_totals" => %{
                "input_tokens" => 4,
                "output_tokens" => 8,
@@ -427,6 +438,7 @@ defmodule SymphonyElixir.ExtensionsTest do
              },
              "retry" => nil,
              "blocked" => nil,
+             "waiting" => nil,
              "logs" => %{"codex_session_logs" => []},
              "recent_events" => [],
              "raw_events" => [],
@@ -456,6 +468,19 @@ defmodule SymphonyElixir.ExtensionsTest do
                "state" => "In Progress",
                "error" => "codex turn requires operator input"
              }
+           } = json_response(conn, 200)
+
+    conn = get(build_conn(), "/api/v1/MT-WAIT")
+
+    assert %{
+             "status" => "waiting",
+             "waiting" => %{
+               "state" => "Human Review",
+               "issue_url" => "https://example.org/issues/MT-WAIT",
+               "updated_at" => _
+             },
+             "recent_events" => [],
+             "raw_events" => []
            } = json_response(conn, 200)
 
     conn = get(build_conn(), "/api/v1/MT-MISSING")
@@ -671,15 +696,20 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "MT-HTTP"
     assert html =~ "MT-RETRY"
     assert html =~ "MT-BLOCKED"
+    assert html =~ "MT-WAIT"
     assert html =~ ~s(href="https://example.org/issues/MT-HTTP")
     assert html =~ ~s(href="https://example.org/issues/MT-RETRY")
     assert html =~ ~s(href="https://example.org/issues/MT-BLOCKED")
+    assert html =~ ~s(href="https://example.org/issues/MT-WAIT")
     assert html =~ ~s(href="/api/v1/MT-HTTP?pretty=1")
     assert html =~ ~s(href="/api/v1/MT-RETRY?pretty=1")
     assert html =~ ~s(href="/api/v1/MT-BLOCKED?pretty=1")
+    assert html =~ ~s(href="/api/v1/MT-WAIT?pretty=1")
     assert html =~ ~s(aria-label="Open MT-HTTP in the issue tracker")
     assert html =~ "rendered"
     assert html =~ "turn blocked: waiting for user input"
+    assert html =~ "Waiting sessions"
+    assert html =~ "Human Review"
     assert html =~ "Runtime"
     assert html =~ "Live"
     assert html =~ "Offline"
@@ -820,7 +850,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     response = Req.get!("http://127.0.0.1:#{port}/api/v1/state")
     assert response.status == 200
-    assert response.body["counts"] == %{"running" => 1, "retrying" => 1, "blocked" => 1}
+    assert response.body["counts"] == %{"running" => 1, "retrying" => 1, "blocked" => 1, "waiting" => 1}
 
     dashboard_css = Req.get!("http://127.0.0.1:#{port}/dashboard.css")
     assert dashboard_css.status == 200
@@ -910,6 +940,15 @@ defmodule SymphonyElixir.ExtensionsTest do
             timestamp: DateTime.utc_now()
           },
           last_codex_timestamp: DateTime.utc_now()
+        }
+      ],
+      waiting: [
+        %{
+          issue_id: "issue-waiting",
+          identifier: "MT-WAIT",
+          issue_url: "https://example.org/issues/MT-WAIT",
+          state: "Human Review",
+          updated_at: DateTime.utc_now()
         }
       ],
       codex_totals: %{input_tokens: 4, output_tokens: 8, total_tokens: 12, seconds_running: 42.5},

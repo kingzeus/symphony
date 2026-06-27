@@ -52,6 +52,7 @@ defmodule SymphonyElixir.Orchestrator do
       :tick_timer_ref,
       :tick_token,
       running: %{},
+      waiting: %{},
       completed: MapSet.new(),
       claimed: MapSet.new(),
       blocked: %{},
@@ -270,6 +271,7 @@ defmodule SymphonyElixir.Orchestrator do
       |> reconcile_blocked_issues()
 
     with :ok <- Config.validate!(),
+         state <- refresh_waiting_issues(state),
          {:ok, issues} <- Tracker.fetch_candidate_issues(),
          true <- available_slots(state) > 0 do
       choose_issues(issues, state)
@@ -561,6 +563,50 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp refresh_waiting_issues(%State{} = state) do
+    waiting_states = Config.settings!().tracker.waiting_states
+
+    case normalized_waiting_states(waiting_states) do
+      [] ->
+        %{state | waiting: %{}}
+
+      _waiting_state_names ->
+        fetch_waiting_issues(state, waiting_states)
+    end
+  end
+
+  defp fetch_waiting_issues(%State{} = state, waiting_states) do
+    case Tracker.fetch_issues_by_states(waiting_states) do
+      {:ok, issues} ->
+        apply_waiting_issues(state, issues)
+
+      {:error, reason} ->
+        Logger.debug("Failed to fetch waiting issue states: #{inspect(reason)}; keeping waiting snapshot")
+        state
+    end
+  end
+
+  defp apply_waiting_issues(%State{} = state, issues) when is_list(issues) do
+    waiting_issues =
+      issues
+      |> Enum.filter(&waiting_issue?/1)
+      |> Enum.reject(&active_runtime_issue?(state, &1))
+
+    state =
+      waiting_issues
+      |> Enum.map(& &1.id)
+      |> release_waiting_retry_claims(state)
+
+    %{state | waiting: waiting_issue_map(waiting_issues)}
+  end
+
+  defp waiting_issue_map(waiting_issues) when is_list(waiting_issues) do
+    waiting_issues
+    |> sort_issues_for_dispatch()
+    |> Enum.map(fn issue -> {issue.id, waiting_issue_metadata(issue)} end)
+    |> Map.new()
+  end
+
   defp terminate_running_issue(%State{} = state, issue_id, cleanup_workspace) do
     case Map.get(state.running, issue_id) do
       nil ->
@@ -581,7 +627,8 @@ defmodule SymphonyElixir.Orchestrator do
           | running: Map.delete(state.running, issue_id),
             claimed: MapSet.delete(state.claimed, issue_id),
             blocked: Map.delete(state.blocked, issue_id),
-            retry_attempts: Map.delete(state.retry_attempts, issue_id)
+            retry_attempts: Map.delete(state.retry_attempts, issue_id),
+            waiting: Map.delete(state.waiting, issue_id)
         }
 
       _ ->
@@ -881,6 +928,56 @@ defmodule SymphonyElixir.Orchestrator do
     Issue.routable?(issue, Config.settings!().tracker.required_labels)
   end
 
+  defp waiting_issue?(%Issue{id: id, identifier: identifier, state: state_name} = issue)
+       when is_binary(id) and is_binary(identifier) and is_binary(state_name) do
+    issue_routable?(issue) and waiting_issue_state?(state_name, waiting_state_set())
+  end
+
+  defp waiting_issue?(_issue), do: false
+
+  defp active_runtime_issue?(%State{} = state, %Issue{id: issue_id}) when is_binary(issue_id) do
+    Map.has_key?(state.running, issue_id) or Map.has_key?(state.blocked, issue_id)
+  end
+
+  defp active_runtime_issue?(_state, _issue), do: false
+
+  defp waiting_issue_metadata(%Issue{} = issue) do
+    %{
+      issue_id: issue.id,
+      identifier: issue.identifier,
+      issue: issue,
+      issue_url: issue.url,
+      state: issue.state,
+      updated_at: issue.updated_at
+    }
+  end
+
+  defp release_waiting_retry_claims(issue_ids, %State{} = state) when is_list(issue_ids) do
+    issue_ids
+    |> Enum.uniq()
+    |> Enum.reduce(state, fn issue_id, state_acc ->
+      release_waiting_retry_claim(state_acc, issue_id)
+    end)
+  end
+
+  defp release_waiting_retry_claim(%State{} = state, issue_id) when is_binary(issue_id) do
+    case Map.get(state.retry_attempts, issue_id) do
+      %{timer_ref: timer_ref} when is_reference(timer_ref) ->
+        Process.cancel_timer(timer_ref, async: true, info: false)
+
+      _ ->
+        :ok
+    end
+
+    %{
+      state
+      | claimed: MapSet.delete(state.claimed, issue_id),
+        retry_attempts: Map.delete(state.retry_attempts, issue_id)
+    }
+  end
+
+  defp release_waiting_retry_claim(state, _issue_id), do: state
+
   defp todo_issue_blocked_by_non_terminal?(
          %Issue{state: issue_state, blocked_by: blockers},
          terminal_states
@@ -908,6 +1005,10 @@ defmodule SymphonyElixir.Orchestrator do
     MapSet.member?(active_states, normalize_issue_state(state_name))
   end
 
+  defp waiting_issue_state?(state_name, waiting_states) when is_binary(state_name) do
+    MapSet.member?(waiting_states, normalize_issue_state(state_name))
+  end
+
   defp normalize_issue_state(state_name) when is_binary(state_name) do
     String.downcase(String.trim(state_name))
   end
@@ -925,6 +1026,20 @@ defmodule SymphonyElixir.Orchestrator do
     |> Enum.filter(&(&1 != ""))
     |> MapSet.new()
   end
+
+  defp waiting_state_set do
+    Config.settings!().tracker.waiting_states
+    |> normalized_waiting_states()
+    |> MapSet.new()
+  end
+
+  defp normalized_waiting_states(waiting_states) when is_list(waiting_states) do
+    waiting_states
+    |> Enum.map(&normalize_issue_state/1)
+    |> Enum.filter(&(&1 != ""))
+  end
+
+  defp normalized_waiting_states(_waiting_states), do: []
 
   defp dispatch_issue(%State{} = state, issue, attempt \\ nil, preferred_worker_host \\ nil) do
     case revalidate_issue_for_dispatch(issue, &Tracker.fetch_issue_states_by_ids/1, terminal_state_set()) do
@@ -998,7 +1113,8 @@ defmodule SymphonyElixir.Orchestrator do
           state
           | running: running,
             claimed: MapSet.put(state.claimed, issue.id),
-            retry_attempts: Map.delete(state.retry_attempts, issue.id)
+            retry_attempts: Map.delete(state.retry_attempts, issue.id),
+            waiting: Map.delete(state.waiting, issue.id)
         }
 
       {:error, reason} ->
@@ -1207,7 +1323,8 @@ defmodule SymphonyElixir.Orchestrator do
       state
       | claimed: MapSet.delete(state.claimed, issue_id),
         blocked: Map.delete(state.blocked, issue_id),
-        retry_attempts: Map.delete(state.retry_attempts, issue_id)
+        retry_attempts: Map.delete(state.retry_attempts, issue_id),
+        waiting: Map.delete(state.waiting, issue_id)
     }
   end
 
@@ -1455,11 +1572,27 @@ defmodule SymphonyElixir.Orchestrator do
         }
       end)
 
+    waiting =
+      state.waiting
+      |> Enum.map(fn {issue_id, metadata} ->
+        %{
+          issue_id: issue_id,
+          identifier: Map.get(metadata, :identifier),
+          issue_url: waiting_issue_url(metadata),
+          state: waiting_issue_state(metadata),
+          updated_at: Map.get(metadata, :updated_at),
+          worker_host: Map.get(metadata, :worker_host),
+          workspace_path: Map.get(metadata, :workspace_path)
+        }
+      end)
+      |> Enum.sort_by(&{&1.identifier || &1.issue_id || "", &1.issue_id || ""})
+
     {:reply,
      %{
        running: running,
        retrying: retrying,
        blocked: blocked,
+       waiting: waiting,
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
        polling: %{
@@ -1490,6 +1623,14 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp blocked_issue_url(%{issue: %Issue{url: url}}), do: url
   defp blocked_issue_url(_metadata), do: nil
+
+  defp waiting_issue_state(%{issue: %Issue{state: state}}), do: state
+  defp waiting_issue_state(%{state: state}), do: state
+  defp waiting_issue_state(_metadata), do: nil
+
+  defp waiting_issue_url(%{issue: %Issue{url: url}}), do: url
+  defp waiting_issue_url(%{issue_url: url}), do: url
+  defp waiting_issue_url(_metadata), do: nil
 
   defp integrate_codex_update(running_entry, %{event: event, timestamp: timestamp} = update) do
     summarized_update = summarize_codex_update(update)

@@ -16,11 +16,13 @@ defmodule SymphonyElixirWeb.Presenter do
           counts: %{
             running: length(snapshot.running),
             retrying: length(snapshot.retrying),
-            blocked: length(Map.get(snapshot, :blocked, []))
+            blocked: length(Map.get(snapshot, :blocked, [])),
+            waiting: length(Map.get(snapshot, :waiting, []))
           },
           running: Enum.map(snapshot.running, &running_entry_payload/1),
           retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
           blocked: Enum.map(Map.get(snapshot, :blocked, []), &blocked_entry_payload/1),
+          waiting: Enum.map(Map.get(snapshot, :waiting, []), &waiting_entry_payload/1),
           codex_totals: snapshot.codex_totals,
           rate_limits: snapshot.rate_limits
         }
@@ -40,11 +42,12 @@ defmodule SymphonyElixirWeb.Presenter do
         running = Enum.find(snapshot.running, &(&1.identifier == issue_identifier))
         retry = Enum.find(snapshot.retrying, &(&1.identifier == issue_identifier))
         blocked = Enum.find(Map.get(snapshot, :blocked, []), &(&1.identifier == issue_identifier))
+        waiting = Enum.find(Map.get(snapshot, :waiting, []), &(&1.identifier == issue_identifier))
 
-        if is_nil(running) and is_nil(retry) and is_nil(blocked) do
+        if is_nil(running) and is_nil(retry) and is_nil(blocked) and is_nil(waiting) do
           {:error, :issue_not_found}
         else
-          {:ok, issue_payload_body(issue_identifier, running, retry, blocked)}
+          {:ok, issue_payload_body(issue_identifier, running, retry, blocked, waiting)}
         end
 
       _ ->
@@ -63,42 +66,54 @@ defmodule SymphonyElixirWeb.Presenter do
     end
   end
 
-  defp issue_payload_body(issue_identifier, running, retry, blocked) do
+  defp issue_payload_body(issue_identifier, running, retry, blocked, waiting) do
+    entries = issue_entries(running, retry, blocked, waiting)
+
     %{
       issue_identifier: issue_identifier,
-      issue_id: issue_id_from_entries(running, retry, blocked),
-      status: issue_status(running, retry, blocked),
-      workspace: %{
-        path: workspace_path(issue_identifier, running, retry, blocked),
-        host: workspace_host(running, retry, blocked)
-      },
-      attempts: %{
-        restart_count: restart_count(retry),
-        current_retry_attempt: retry_attempt(retry)
-      },
-      running: running && running_issue_payload(running),
-      retry: retry && retry_issue_payload(retry),
-      blocked: blocked && blocked_issue_payload(blocked),
+      issue_id: issue_id_from_entries(entries),
+      status: issue_status(entries),
+      workspace: workspace_payload(issue_identifier, entries),
+      attempts: retry_attempts_payload(retry),
+      running: optional_payload(running, &running_issue_payload/1),
+      retry: optional_payload(retry, &retry_issue_payload/1),
+      blocked: optional_payload(blocked, &blocked_issue_payload/1),
+      waiting: optional_payload(waiting, &waiting_issue_payload/1),
       logs: %{
         codex_session_logs: []
       },
-      recent_events: recent_events_payload(running || blocked),
-      raw_events: raw_events_payload(running || blocked),
-      last_error: (blocked && blocked.error) || (retry && retry.error),
+      recent_events: recent_events_payload(event_entry(entries)),
+      raw_events: raw_events_payload(event_entry(entries)),
+      last_error: last_error(entries),
       tracked: %{}
     }
   end
 
-  defp issue_id_from_entries(running, retry, blocked),
-    do: (running && running.issue_id) || (retry && retry.issue_id) || (blocked && blocked.issue_id)
+  defp issue_entries(running, retry, blocked, waiting) do
+    %{running: running, retry: retry, blocked: blocked, waiting: waiting}
+  end
+
+  defp issue_id_from_entries(%{running: %{issue_id: issue_id}}), do: issue_id
+  defp issue_id_from_entries(%{retry: %{issue_id: issue_id}}), do: issue_id
+  defp issue_id_from_entries(%{blocked: %{issue_id: issue_id}}), do: issue_id
+  defp issue_id_from_entries(%{waiting: %{issue_id: issue_id}}), do: issue_id
+  defp issue_id_from_entries(_entries), do: nil
 
   defp restart_count(retry), do: max(retry_attempt(retry) - 1, 0)
   defp retry_attempt(nil), do: 0
   defp retry_attempt(retry), do: retry.attempt || 0
 
-  defp issue_status(running, _retry, _blocked) when not is_nil(running), do: "running"
-  defp issue_status(nil, retry, _blocked) when not is_nil(retry), do: "retrying"
-  defp issue_status(nil, nil, _blocked), do: "blocked"
+  defp issue_status(%{running: running}) when not is_nil(running), do: "running"
+  defp issue_status(%{retry: retry}) when not is_nil(retry), do: "retrying"
+  defp issue_status(%{blocked: blocked}) when not is_nil(blocked), do: "blocked"
+  defp issue_status(_entries), do: "waiting"
+
+  defp retry_attempts_payload(retry) do
+    %{restart_count: restart_count(retry), current_retry_attempt: retry_attempt(retry)}
+  end
+
+  defp optional_payload(nil, _payload_fun), do: nil
+  defp optional_payload(entry, payload_fun), do: payload_fun.(entry)
 
   defp running_entry_payload(entry) do
     recent_events = recent_events_payload(entry)
@@ -156,6 +171,18 @@ defmodule SymphonyElixirWeb.Presenter do
     }
   end
 
+  defp waiting_entry_payload(entry) do
+    %{
+      issue_id: entry.issue_id,
+      issue_identifier: entry.identifier,
+      issue_url: Map.get(entry, :issue_url),
+      state: entry.state,
+      updated_at: iso8601(entry.updated_at),
+      worker_host: Map.get(entry, :worker_host),
+      workspace_path: Map.get(entry, :workspace_path)
+    }
+  end
+
   defp running_issue_payload(running) do
     recent_events = recent_events_payload(running)
 
@@ -202,18 +229,50 @@ defmodule SymphonyElixirWeb.Presenter do
     }
   end
 
-  defp workspace_path(issue_identifier, running, retry, blocked) do
-    (running && Map.get(running, :workspace_path)) ||
-      (retry && Map.get(retry, :workspace_path)) ||
-      (blocked && Map.get(blocked, :workspace_path)) ||
+  defp waiting_issue_payload(waiting) do
+    %{
+      state: waiting.state,
+      updated_at: iso8601(waiting.updated_at),
+      issue_url: Map.get(waiting, :issue_url),
+      worker_host: Map.get(waiting, :worker_host),
+      workspace_path: Map.get(waiting, :workspace_path)
+    }
+  end
+
+  defp workspace_payload(issue_identifier, entries) do
+    %{
+      path: workspace_path(issue_identifier, entries),
+      host: workspace_host(entries)
+    }
+  end
+
+  defp workspace_path(issue_identifier, entries) do
+    first_entry_value(entries, :workspace_path) ||
       Path.join(Config.settings!().workspace.root, issue_identifier)
   end
 
-  defp workspace_host(running, retry, blocked) do
-    (running && Map.get(running, :worker_host)) ||
-      (retry && Map.get(retry, :worker_host)) ||
-      (blocked && Map.get(blocked, :worker_host))
+  defp workspace_host(entries), do: first_entry_value(entries, :worker_host)
+
+  defp first_entry_value(entries, field) do
+    entries
+    |> ordered_entry_values()
+    |> Enum.find_value(&entry_value(&1, field))
   end
+
+  defp ordered_entry_values(entries) do
+    Enum.map([:running, :retry, :blocked, :waiting], &Map.get(entries, &1))
+  end
+
+  defp entry_value(nil, _field), do: nil
+  defp entry_value(entry, field), do: Map.get(entry, field)
+
+  defp event_entry(%{running: running}) when not is_nil(running), do: running
+  defp event_entry(%{blocked: blocked}) when not is_nil(blocked), do: blocked
+  defp event_entry(_entries), do: nil
+
+  defp last_error(%{blocked: %{error: error}}) when not is_nil(error), do: error
+  defp last_error(%{retry: %{error: error}}), do: error
+  defp last_error(_entries), do: nil
 
   defp recent_events_payload(nil), do: []
 

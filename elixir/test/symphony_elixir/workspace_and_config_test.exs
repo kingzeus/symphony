@@ -879,6 +879,10 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
     assert message =~ "tracker.active_states"
 
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_waiting_states: "Human Review")
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "tracker.waiting_states"
+
     write_workflow_file!(Workflow.workflow_file_path(), max_concurrent_agents: "bad")
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
     assert message =~ "agent.max_concurrent_agents"
@@ -901,6 +905,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_active_states: %{todo: true},
+      tracker_waiting_states: %{review: true},
       tracker_terminal_states: %{done: true},
       poll_interval_ms: %{bad: true},
       workspace_root: 123,

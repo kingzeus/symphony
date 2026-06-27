@@ -7,6 +7,7 @@ defmodule SymphonyElixir.CoreTest do
       tracker_project_slug: nil,
       poll_interval_ms: nil,
       tracker_active_states: nil,
+      tracker_waiting_states: nil,
       tracker_terminal_states: nil,
       codex_command: nil
     )
@@ -14,6 +15,7 @@ defmodule SymphonyElixir.CoreTest do
     config = Config.settings!()
     assert config.polling.interval_ms == 30_000
     assert config.tracker.active_states == ["Todo", "In Progress"]
+    assert config.tracker.waiting_states == ["Human Review"]
     assert config.tracker.terminal_states == ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
     assert config.tracker.assignee == nil
     assert config.agent.max_turns == 20
@@ -101,6 +103,7 @@ defmodule SymphonyElixir.CoreTest do
     assert Map.get(tracker, "kind") == "linear"
     assert is_binary(Map.get(tracker, "project_slug"))
     assert is_list(Map.get(tracker, "active_states"))
+    assert is_list(Map.get(tracker, "waiting_states"))
     assert is_list(Map.get(tracker, "terminal_states"))
 
     hooks = Map.get(config, "hooks", %{})

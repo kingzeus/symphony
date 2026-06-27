@@ -8,6 +8,8 @@ tracker:
     - In Progress
     - Merging
     - Rework
+  waiting_states:
+    - Human Review
   terminal_states:
     - Closed
     - Cancelled

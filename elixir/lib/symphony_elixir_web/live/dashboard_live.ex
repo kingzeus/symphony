@@ -112,6 +112,12 @@ defmodule SymphonyElixirWeb.DashboardLive do
           </article>
 
           <article class="metric-card">
+            <p class="metric-label">Waiting</p>
+            <p class="metric-value numeric"><%= @payload.counts.waiting %></p>
+            <p class="metric-detail">Issues waiting for manual review or handoff.</p>
+          </article>
+
+          <article class="metric-card">
             <p class="metric-label">Blocked</p>
             <p class="metric-value numeric"><%= @payload.counts.blocked %></p>
             <p class="metric-detail">Issues paused for operator input or approval.</p>
@@ -320,6 +326,49 @@ defmodule SymphonyElixirWeb.DashboardLive do
             <% else %>
               <p class="detail-hint">Click a running session to inspect live execution details.</p>
             <% end %>
+          <% end %>
+        </section>
+
+        <section class="section-card">
+          <div class="section-header">
+            <div>
+              <h2 class="section-title">Waiting sessions</h2>
+              <p class="section-copy">Issues in manual review or other configured waiting states.</p>
+            </div>
+          </div>
+
+          <%= if @payload.waiting == [] do %>
+            <p class="empty-state">No issues are waiting for manual review.</p>
+          <% else %>
+            <div class="table-wrap">
+              <table class="data-table" style="min-width: 700px;">
+                <thead>
+                  <tr>
+                    <th>Issue</th>
+                    <th>State</th>
+                    <th>Updated at</th>
+                    <th>Workspace</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr :for={entry <- @payload.waiting}>
+                    <td>
+                      <div class="issue-stack">
+                        <.issue_identifier identifier={entry.issue_identifier} url={entry.issue_url} />
+                        <a class="issue-link" href={json_details_path(entry.issue_identifier)}>JSON details</a>
+                      </div>
+                    </td>
+                    <td>
+                      <span class={state_badge_class(entry.state || "Waiting")}>
+                        <%= entry.state || "Waiting" %>
+                      </span>
+                    </td>
+                    <td class="mono"><%= entry.updated_at || "n/a" %></td>
+                    <td class="mono"><%= entry.workspace_path || "n/a" %></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
           <% end %>
         </section>
 
@@ -589,10 +638,17 @@ defmodule SymphonyElixirWeb.DashboardLive do
     normalized = state |> to_string() |> String.downcase()
 
     cond do
-      String.contains?(normalized, ["progress", "running", "active"]) -> "#{base} state-badge-active"
-      String.contains?(normalized, ["blocked", "error", "failed"]) -> "#{base} state-badge-danger"
-      String.contains?(normalized, ["todo", "queued", "pending", "retry"]) -> "#{base} state-badge-warning"
-      true -> base
+      String.contains?(normalized, ["progress", "running", "active"]) ->
+        "#{base} state-badge-active"
+
+      String.contains?(normalized, ["blocked", "error", "failed"]) ->
+        "#{base} state-badge-danger"
+
+      String.contains?(normalized, ["todo", "queued", "pending", "retry", "review", "waiting"]) ->
+        "#{base} state-badge-warning"
+
+      true ->
+        base
     end
   end
 

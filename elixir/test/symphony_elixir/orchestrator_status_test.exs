@@ -996,6 +996,75 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert next_poll_in_ms <= 50
   end
 
+  test "orchestrator snapshot includes routable waiting issues from configured waiting states" do
+    previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+    updated_at = DateTime.utc_now()
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_required_labels: ["symphony"],
+      tracker_waiting_states: ["Human Review"],
+      poll_interval_ms: 30_000
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [
+      %Issue{
+        id: "issue-waiting",
+        identifier: "MT-WAIT",
+        title: "Waiting for manual review",
+        state: "Human Review",
+        labels: ["symphony"],
+        url: "https://example.org/issues/MT-WAIT",
+        updated_at: updated_at
+      },
+      %Issue{
+        id: "issue-unrouted-waiting",
+        identifier: "MT-NOPE",
+        title: "Not routed",
+        state: "Human Review",
+        labels: [],
+        url: "https://example.org/issues/MT-NOPE",
+        updated_at: updated_at
+      }
+    ])
+
+    orchestrator_name = Module.concat(__MODULE__, :WaitingIssueOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      restore_app_env(:memory_tracker_issues, previous_memory_issues)
+
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    snapshot =
+      wait_for_snapshot(
+        pid,
+        fn
+          %{waiting: [%{identifier: "MT-WAIT"}]} -> true
+          _ -> false
+        end,
+        1_000
+      )
+
+    assert snapshot.running == []
+    assert snapshot.retrying == []
+
+    assert [
+             %{
+               issue_id: "issue-waiting",
+               identifier: "MT-WAIT",
+               issue_url: "https://example.org/issues/MT-WAIT",
+               state: "Human Review",
+               updated_at: ^updated_at,
+               worker_host: nil,
+               workspace_path: nil
+             }
+           ] = snapshot.waiting
+  end
+
   test "orchestrator restarts stalled workers with retry backoff" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_api_token: nil,
@@ -1879,6 +1948,9 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       end
     end
   end
+
+  defp restore_app_env(key, nil), do: Application.delete_env(:symphony_elixir, key)
+  defp restore_app_env(key, value), do: Application.put_env(:symphony_elixir, key, value)
 
   defp graph_samples_from_rates(rates_per_bucket) do
     bucket_ms = 25_000
