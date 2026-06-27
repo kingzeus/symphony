@@ -656,16 +656,6 @@ defmodule SymphonyElixir.CoreTest do
   test "normal worker exit schedules active-state continuation retry" do
     issue_id = "issue-resume"
     ref = make_ref()
-    orchestrator_name = Module.concat(__MODULE__, :ContinuationOrchestrator)
-    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
-
-    on_exit(fn ->
-      if Process.alive?(pid) do
-        Process.exit(pid, :normal)
-      end
-    end)
-
-    initial_state = :sys.get_state(pid)
 
     running_entry = %{
       pid: self(),
@@ -675,37 +665,22 @@ defmodule SymphonyElixir.CoreTest do
       started_at: DateTime.utc_now()
     }
 
-    :sys.replace_state(pid, fn _ ->
-      initial_state
-      |> Map.put(:running, %{issue_id => running_entry})
-      |> Map.put(:claimed, MapSet.new([issue_id]))
-      |> Map.put(:retry_attempts, %{})
-    end)
+    state = orchestrator_state_with_running_issue(issue_id, running_entry)
 
-    send(pid, {:DOWN, ref, :process, self(), :normal})
-    Process.sleep(50)
-    state = :sys.get_state(pid)
+    assert {:noreply, state} = Orchestrator.handle_info({:DOWN, ref, :process, self(), :normal}, state)
 
     refute Map.has_key?(state.running, issue_id)
     assert MapSet.member?(state.completed, issue_id)
     assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
     assert is_integer(due_at_ms)
     assert_due_in_range(due_at_ms, 500, 1_100)
+
+    cancel_retry_timer(state, issue_id)
   end
 
   test "abnormal worker exit increments retry attempt progressively" do
     issue_id = "issue-crash"
     ref = make_ref()
-    orchestrator_name = Module.concat(__MODULE__, :CrashRetryOrchestrator)
-    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
-
-    on_exit(fn ->
-      if Process.alive?(pid) do
-        Process.exit(pid, :normal)
-      end
-    end)
-
-    initial_state = :sys.get_state(pid)
 
     running_entry = %{
       pid: self(),
@@ -716,36 +691,21 @@ defmodule SymphonyElixir.CoreTest do
       started_at: DateTime.utc_now()
     }
 
-    :sys.replace_state(pid, fn _ ->
-      initial_state
-      |> Map.put(:running, %{issue_id => running_entry})
-      |> Map.put(:claimed, MapSet.new([issue_id]))
-      |> Map.put(:retry_attempts, %{})
-    end)
+    state = orchestrator_state_with_running_issue(issue_id, running_entry)
 
-    send(pid, {:DOWN, ref, :process, self(), :boom})
-    Process.sleep(50)
-    state = :sys.get_state(pid)
+    assert {:noreply, state} = Orchestrator.handle_info({:DOWN, ref, :process, self(), :boom}, state)
 
     assert %{attempt: 3, due_at_ms: due_at_ms, identifier: "MT-559", error: "agent exited: :boom"} =
              state.retry_attempts[issue_id]
 
     assert_due_in_range(due_at_ms, 39_500, 40_500)
+
+    cancel_retry_timer(state, issue_id)
   end
 
   test "first abnormal worker exit waits before retrying" do
     issue_id = "issue-crash-initial"
     ref = make_ref()
-    orchestrator_name = Module.concat(__MODULE__, :InitialCrashRetryOrchestrator)
-    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
-
-    on_exit(fn ->
-      if Process.alive?(pid) do
-        Process.exit(pid, :normal)
-      end
-    end)
-
-    initial_state = :sys.get_state(pid)
 
     running_entry = %{
       pid: self(),
@@ -755,21 +715,16 @@ defmodule SymphonyElixir.CoreTest do
       started_at: DateTime.utc_now()
     }
 
-    :sys.replace_state(pid, fn _ ->
-      initial_state
-      |> Map.put(:running, %{issue_id => running_entry})
-      |> Map.put(:claimed, MapSet.new([issue_id]))
-      |> Map.put(:retry_attempts, %{})
-    end)
+    state = orchestrator_state_with_running_issue(issue_id, running_entry)
 
-    send(pid, {:DOWN, ref, :process, self(), :boom})
-    Process.sleep(50)
-    state = :sys.get_state(pid)
+    assert {:noreply, state} = Orchestrator.handle_info({:DOWN, ref, :process, self(), :boom}, state)
 
     assert %{attempt: 1, due_at_ms: due_at_ms, identifier: "MT-560", error: "agent exited: :boom"} =
              state.retry_attempts[issue_id]
 
     assert_due_in_range(due_at_ms, 9_000, 10_500)
+
+    cancel_retry_timer(state, issue_id)
   end
 
   test "stale retry timer messages do not consume newer retry entries" do
@@ -894,6 +849,26 @@ defmodule SymphonyElixir.CoreTest do
 
     assert remaining_ms >= min_remaining_ms
     assert remaining_ms <= max_remaining_ms
+  end
+
+  defp orchestrator_state_with_running_issue(issue_id, running_entry) do
+    %Orchestrator.State{
+      poll_interval_ms: 30_000,
+      max_concurrent_agents: 1,
+      running: %{issue_id => running_entry},
+      claimed: MapSet.new([issue_id]),
+      retry_attempts: %{},
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      codex_rate_limits: nil
+    }
+  end
+
+  defp cancel_retry_timer(state, issue_id) do
+    retry = Map.get(state.retry_attempts, issue_id)
+
+    if is_map(retry) and is_reference(retry[:timer_ref]) do
+      Process.cancel_timer(retry.timer_ref)
+    end
   end
 
   defp restore_app_env(key, nil), do: Application.delete_env(:symphony_elixir, key)
