@@ -187,7 +187,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                         <.issue_identifier identifier={entry.issue_identifier} url={entry.issue_url} />
                         <a
                           class="issue-link"
-                          href={"/api/v1/#{entry.issue_identifier}"}
+                          href={json_details_path(entry.issue_identifier)}
                           onclick="event.stopPropagation();"
                         >JSON details</a>
                       </div>
@@ -351,7 +351,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                     <td>
                       <div class="issue-stack">
                         <.issue_identifier identifier={entry.issue_identifier} url={entry.issue_url} />
-                        <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON details</a>
+                        <a class="issue-link" href={json_details_path(entry.issue_identifier)}>JSON details</a>
                       </div>
                     </td>
                     <td>
@@ -423,7 +423,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                     <td>
                       <div class="issue-stack">
                         <.issue_identifier identifier={entry.issue_identifier} url={entry.issue_url} />
-                        <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON details</a>
+                        <a class="issue-link" href={json_details_path(entry.issue_identifier)}>JSON details</a>
                       </div>
                     </td>
                     <td><%= entry.attempt %></td>
@@ -470,6 +470,10 @@ defmodule SymphonyElixirWeb.DashboardLive do
     else
       base
     end
+  end
+
+  defp json_details_path(issue_identifier) do
+    "/api/v1/#{URI.encode(to_string(issue_identifier))}?pretty=1"
   end
 
   defp recent_events_for_display(events) when is_list(events) do

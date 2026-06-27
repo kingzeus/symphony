@@ -9,15 +9,15 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
   alias SymphonyElixirWeb.{Endpoint, Presenter}
 
   @spec state(Conn.t(), map()) :: Conn.t()
-  def state(conn, _params) do
-    json(conn, Presenter.state_payload(orchestrator(), snapshot_timeout_ms()))
+  def state(conn, params) do
+    render_json(conn, Presenter.state_payload(orchestrator(), snapshot_timeout_ms()), params)
   end
 
   @spec issue(Conn.t(), map()) :: Conn.t()
-  def issue(conn, %{"issue_identifier" => issue_identifier}) do
+  def issue(conn, %{"issue_identifier" => issue_identifier} = params) do
     case Presenter.issue_payload(issue_identifier, orchestrator(), snapshot_timeout_ms()) do
       {:ok, payload} ->
-        json(conn, payload)
+        render_json(conn, payload, params)
 
       {:error, :issue_not_found} ->
         error_response(conn, 404, "issue_not_found", "Issue not found")
@@ -52,6 +52,14 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
     |> put_status(status)
     |> json(%{error: %{code: code, message: message}})
   end
+
+  defp render_json(conn, payload, %{"pretty" => pretty}) when pretty in ["1", "true"] do
+    conn
+    |> put_resp_content_type("application/json")
+    |> send_resp(200, Jason.encode!(payload, pretty: true) <> "\n")
+  end
+
+  defp render_json(conn, payload, _params), do: json(conn, payload)
 
   defp orchestrator do
     Endpoint.config(:orchestrator) || SymphonyElixir.Orchestrator

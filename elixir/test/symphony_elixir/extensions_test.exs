@@ -434,6 +434,13 @@ defmodule SymphonyElixir.ExtensionsTest do
              "tracked" => %{}
            }
 
+    pretty_conn = get(build_conn(), "/api/v1/MT-HTTP?pretty=1")
+    pretty_body = response(pretty_conn, 200)
+    assert Plug.Conn.get_resp_header(pretty_conn, "content-type") == ["application/json; charset=utf-8"]
+    assert pretty_body =~ "{\n"
+    assert pretty_body =~ ~s(\n  "issue_identifier": "MT-HTTP")
+    assert pretty_body =~ ~s(\n  "raw_events": [])
+
     conn = get(build_conn(), "/api/v1/MT-RETRY")
 
     assert %{"status" => "retrying", "retry" => %{"attempt" => 2, "error" => "boom"}} =
@@ -667,6 +674,9 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ ~s(href="https://example.org/issues/MT-HTTP")
     assert html =~ ~s(href="https://example.org/issues/MT-RETRY")
     assert html =~ ~s(href="https://example.org/issues/MT-BLOCKED")
+    assert html =~ ~s(href="/api/v1/MT-HTTP?pretty=1")
+    assert html =~ ~s(href="/api/v1/MT-RETRY?pretty=1")
+    assert html =~ ~s(href="/api/v1/MT-BLOCKED?pretty=1")
     assert html =~ ~s(aria-label="Open MT-HTTP in the issue tracker")
     assert html =~ "rendered"
     assert html =~ "turn blocked: waiting for user input"
