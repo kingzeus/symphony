@@ -181,6 +181,21 @@ defmodule SymphonyElixir.CoreTest do
              Workflow.load(workflow_path)
   end
 
+  test "workflow load preserves utf-8 prompt content with Chinese characters" do
+    workflow_path = Path.join(Path.dirname(Workflow.workflow_file_path()), "UTF8_WORKFLOW.md")
+
+    File.write!(
+      workflow_path,
+      "---\ntracker:\n  kind: memory\n---\n你正在处理 Linear 工单 `TIK-10`。\n\n- 如果缺少必要权限，请记录阻塞项。\n"
+    )
+
+    assert {:ok, %{prompt: prompt, prompt_template: prompt_template}} = Workflow.load(workflow_path)
+    assert String.valid?(prompt)
+    assert prompt == prompt_template
+    assert prompt =~ "必要权限"
+    assert Jason.encode!(%{"prompt" => prompt})
+  end
+
   test "workflow load accepts unterminated front matter with an empty prompt" do
     workflow_path = Path.join(Path.dirname(Workflow.workflow_file_path()), "UNTERMINATED_WORKFLOW.md")
     File.write!(workflow_path, "---\ntracker:\n  kind: linear\n")
