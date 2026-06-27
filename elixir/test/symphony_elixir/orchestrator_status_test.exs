@@ -107,6 +107,97 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
            ]
   end
 
+  test "orchestrator merges streaming deltas without evicting prior codex history" do
+    issue_id = "issue-streaming-history"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-STREAM",
+      title: "Streaming history test",
+      description: "Capture merged and raw streaming state",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-STREAM"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :StreamingHistoryOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+    started_at = DateTime.utc_now()
+
+    running_entry = %{
+      pid: self(),
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: nil,
+      turn_count: 0,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      started_at: started_at
+    }
+
+    state_with_issue =
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+
+    :sys.replace_state(pid, fn _ -> state_with_issue end)
+
+    base_at = DateTime.utc_now()
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :notification,
+         payload: %{method: "before-stream"},
+         timestamp: base_at
+       }}
+    )
+
+    stream_text = "The answer keeps appending"
+    deltas = String.graphemes(stream_text)
+
+    deltas
+    |> Enum.with_index(1)
+    |> Enum.each(fn {delta, index} ->
+      send(
+        pid,
+        {:codex_worker_update, issue_id, streaming_delta_worker_update("msg-1", delta, DateTime.add(base_at, index, :second))}
+      )
+    end)
+
+    latest_at = DateTime.add(base_at, length(deltas), :second)
+    snapshot = GenServer.call(pid, :snapshot)
+    assert %{running: [snapshot_entry]} = snapshot
+
+    assert [
+             %{event: :notification, message: %{method: "before-stream"}, timestamp: ^base_at},
+             merged_stream
+           ] = snapshot_entry.codex_updates
+
+    assert merged_stream.event == :notification
+    assert merged_stream.timestamp == latest_at
+    assert merged_stream.display_message == "agent message streaming: #{stream_text}"
+    assert merged_stream.stream_merge.key == {"agent message streaming", "msg-1"}
+    assert merged_stream.stream_merge.delta == stream_text
+    assert snapshot_entry.last_codex_message == merged_stream
+
+    assert length(snapshot_entry.raw_codex_updates) == length(deltas) + 1
+
+    assert snapshot_entry.raw_codex_updates
+           |> tl()
+           |> Enum.map(&get_in(&1, [:payload, "params", "msg", "payload", "delta"])) == deltas
+  end
+
   test "orchestrator snapshot tracks codex thread totals and app-server pid" do
     issue_id = "issue-usage-snapshot"
 
@@ -1750,6 +1841,23 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     assert rendered =~ "app_status=offline"
     refute rendered =~ "Timestamp:"
+  end
+
+  defp streaming_delta_worker_update(message_id, delta, timestamp) do
+    %{
+      event: :notification,
+      payload: %{
+        "method" => "codex/event/agent_message_delta",
+        "params" => %{
+          "msg" => %{
+            "id" => message_id,
+            "payload" => %{"delta" => delta}
+          }
+        }
+      },
+      raw: "stream-delta:#{delta}",
+      timestamp: timestamp
+    }
   end
 
   defp wait_for_snapshot(pid, predicate, timeout_ms \\ 200) when is_function(predicate, 1) do

@@ -1071,6 +1071,14 @@ defmodule SymphonyElixir.StatusDashboard do
   @spec humanize_codex_message(term()) :: String.t()
   def humanize_codex_message(nil), do: "no codex message yet"
 
+  def humanize_codex_message(%{display_message: message}) when is_binary(message) do
+    truncate(message, 140)
+  end
+
+  def humanize_codex_message(%{"display_message" => message}) when is_binary(message) do
+    truncate(message, 140)
+  end
+
   def humanize_codex_message(%{event: event, message: message}) do
     payload = unwrap_codex_message_payload(message)
 

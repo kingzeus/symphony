@@ -13,6 +13,23 @@ defmodule SymphonyElixir.Orchestrator do
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
   @max_codex_update_history 20
+  @max_raw_codex_update_history 200
+  @item_streaming_labels %{
+    "item/agentMessage/delta" => "agent message streaming",
+    "item/plan/delta" => "plan streaming",
+    "item/reasoning/summaryTextDelta" => "reasoning summary streaming",
+    "item/reasoning/summaryPartAdded" => "reasoning summary section added",
+    "item/reasoning/textDelta" => "reasoning text streaming",
+    "item/commandExecution/outputDelta" => "command output streaming",
+    "item/fileChange/outputDelta" => "file change output streaming"
+  }
+  @wrapper_streaming_labels %{
+    "agent_message_delta" => "agent message streaming",
+    "agent_message_content_delta" => "agent message content streaming",
+    "agent_reasoning_delta" => "reasoning streaming",
+    "reasoning_content_delta" => "reasoning content streaming",
+    "exec_command_output_delta" => "command output streaming"
+  }
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
   @empty_codex_totals %{
@@ -756,7 +773,8 @@ defmodule SymphonyElixir.Orchestrator do
       last_codex_message: Map.get(running_entry, :last_codex_message),
       last_codex_event: Map.get(running_entry, :last_codex_event),
       last_codex_timestamp: Map.get(running_entry, :last_codex_timestamp),
-      codex_updates: Map.get(running_entry, :codex_updates, [])
+      codex_updates: Map.get(running_entry, :codex_updates, []),
+      raw_codex_updates: Map.get(running_entry, :raw_codex_updates, [])
     }
 
     %{
@@ -963,6 +981,7 @@ defmodule SymphonyElixir.Orchestrator do
             last_codex_timestamp: nil,
             last_codex_event: nil,
             codex_updates: [],
+            raw_codex_updates: [],
             codex_app_server_pid: nil,
             codex_input_tokens: 0,
             codex_output_tokens: 0,
@@ -1395,6 +1414,7 @@ defmodule SymphonyElixir.Orchestrator do
           last_codex_message: metadata.last_codex_message,
           last_codex_event: metadata.last_codex_event,
           codex_updates: Map.get(metadata, :codex_updates, []),
+          raw_codex_updates: Map.get(metadata, :raw_codex_updates, []),
           runtime_seconds: running_seconds(metadata.started_at, now)
         }
       end)
@@ -1430,7 +1450,8 @@ defmodule SymphonyElixir.Orchestrator do
           last_codex_timestamp: Map.get(metadata, :last_codex_timestamp),
           last_codex_message: Map.get(metadata, :last_codex_message),
           last_codex_event: Map.get(metadata, :last_codex_event),
-          codex_updates: Map.get(metadata, :codex_updates, [])
+          codex_updates: Map.get(metadata, :codex_updates, []),
+          raw_codex_updates: Map.get(metadata, :raw_codex_updates, [])
         }
       end)
 
@@ -1472,6 +1493,8 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp integrate_codex_update(running_entry, %{event: event, timestamp: timestamp} = update) do
     summarized_update = summarize_codex_update(update)
+    codex_updates = append_codex_update(running_entry, summarized_update)
+    last_codex_message = List.last(codex_updates) || summarized_update
     token_delta = extract_token_delta(running_entry, update)
     codex_input_tokens = Map.get(running_entry, :codex_input_tokens, 0)
     codex_output_tokens = Map.get(running_entry, :codex_output_tokens, 0)
@@ -1485,10 +1508,11 @@ defmodule SymphonyElixir.Orchestrator do
     {
       Map.merge(running_entry, %{
         last_codex_timestamp: timestamp,
-        last_codex_message: summarized_update,
+        last_codex_message: last_codex_message,
         session_id: session_id_for_update(running_entry.session_id, update),
         last_codex_event: event,
-        codex_updates: append_codex_update(running_entry, summarized_update),
+        codex_updates: codex_updates,
+        raw_codex_updates: append_raw_codex_update(running_entry, update),
         codex_app_server_pid: codex_app_server_pid_for_update(codex_app_server_pid, update),
         codex_input_tokens: codex_input_tokens + token_delta.input_tokens,
         codex_output_tokens: codex_output_tokens + token_delta.output_tokens,
@@ -1509,8 +1533,222 @@ defmodule SymphonyElixir.Orchestrator do
         _ -> []
       end
 
-    (history ++ [summarized_update])
+    history
+    |> append_merged_codex_update(summarized_update)
     |> Enum.take(-@max_codex_update_history)
+  end
+
+  defp append_raw_codex_update(running_entry, update) do
+    history =
+      case Map.get(running_entry, :raw_codex_updates) do
+        updates when is_list(updates) -> updates
+        _ -> []
+      end
+
+    (history ++ [update])
+    |> Enum.take(-@max_raw_codex_update_history)
+  end
+
+  defp append_merged_codex_update(history, summarized_update) do
+    case streaming_update(summarized_update) do
+      %{key: key} = stream ->
+        append_streaming_codex_update(history, summarized_update, stream, key)
+
+      nil ->
+        history ++ [summarized_update]
+    end
+  end
+
+  defp append_streaming_codex_update(history, summarized_update, stream, key) do
+    {previous, rest} = List.pop_at(history, -1)
+
+    if is_map(previous) and stream_merge_key(previous) == key do
+      rest ++ [merge_streaming_update(previous, summarized_update, stream)]
+    else
+      history ++ [new_streaming_update(summarized_update, stream)]
+    end
+  end
+
+  defp new_streaming_update(update, stream) do
+    update
+    |> Map.put(:display_message, streaming_display_message(stream.label, stream.delta))
+    |> Map.put(:stream_merge, stream)
+  end
+
+  defp merge_streaming_update(previous, update, stream) do
+    previous_stream = Map.fetch!(previous, :stream_merge)
+    merged_delta = previous_stream.delta <> stream.delta
+    merged_stream = %{previous_stream | delta: merged_delta}
+
+    previous
+    |> Map.put(:event, Map.get(update, :event))
+    |> Map.put(:message, Map.get(update, :message))
+    |> Map.put(:timestamp, Map.get(update, :timestamp) || Map.get(previous, :timestamp))
+    |> Map.put(:display_message, streaming_display_message(stream.label, merged_delta))
+    |> Map.put(:stream_merge, merged_stream)
+  end
+
+  defp stream_merge_key(%{stream_merge: %{key: key}}), do: key
+  defp stream_merge_key(_update), do: nil
+
+  defp streaming_update(update) do
+    payload =
+      update
+      |> Map.get(:message)
+      |> codex_update_payload_source()
+
+    label = streaming_label(payload)
+    delta = streaming_delta(payload)
+
+    if is_binary(label) and is_binary(delta) and delta != "" do
+      %{key: {label, streaming_group_id(payload) || :adjacent}, label: label, delta: delta}
+    end
+  end
+
+  defp codex_update_payload_source(%{} = message) do
+    if is_binary(map_value(message, ["method", :method])) do
+      message
+    else
+      map_value(message, ["payload", :payload]) || message
+    end
+  end
+
+  defp codex_update_payload_source(message), do: message
+
+  defp streaming_label(payload) when is_map(payload) do
+    case map_value(payload, ["method", :method]) do
+      <<"codex/event/", suffix::binary>> -> Map.get(@wrapper_streaming_labels, suffix)
+      method when is_binary(method) -> Map.get(@item_streaming_labels, method)
+      _ -> nil
+    end
+  end
+
+  defp streaming_label(_payload), do: nil
+
+  defp streaming_delta(payload) when is_map(payload), do: extract_first_path(payload, delta_paths())
+  defp streaming_delta(_payload), do: nil
+
+  defp streaming_group_id(payload) when is_map(payload) do
+    extract_first_path(payload, [
+      ["params", "itemId"],
+      [:params, :itemId],
+      ["params", "item_id"],
+      [:params, :item_id],
+      ["params", "item", "id"],
+      [:params, :item, :id],
+      ["params", "msg", "id"],
+      [:params, :msg, :id],
+      ["params", "msg", "itemId"],
+      [:params, :msg, :itemId],
+      ["params", "msg", "item_id"],
+      [:params, :msg, :item_id],
+      ["params", "msg", "payload", "id"],
+      [:params, :msg, :payload, :id],
+      ["params", "msg", "payload", "itemId"],
+      [:params, :msg, :payload, :itemId],
+      ["params", "msg", "payload", "item_id"],
+      [:params, :msg, :payload, :item_id]
+    ])
+  end
+
+  defp streaming_group_id(_payload), do: nil
+
+  defp streaming_display_message(label, delta) do
+    "#{label}: #{inline_stream_text(delta)}"
+  end
+
+  defp delta_paths do
+    [
+      ["params", "delta"],
+      [:params, :delta],
+      ["params", "msg", "delta"],
+      [:params, :msg, :delta],
+      ["params", "textDelta"],
+      [:params, :textDelta],
+      ["params", "msg", "textDelta"],
+      [:params, :msg, :textDelta],
+      ["params", "outputDelta"],
+      [:params, :outputDelta],
+      ["params", "msg", "outputDelta"],
+      [:params, :msg, :outputDelta],
+      ["params", "text"],
+      [:params, :text],
+      ["params", "msg", "text"],
+      [:params, :msg, :text],
+      ["params", "summaryText"],
+      [:params, :summaryText],
+      ["params", "msg", "summaryText"],
+      [:params, :msg, :summaryText],
+      ["params", "msg", "content"],
+      [:params, :msg, :content],
+      ["params", "msg", "payload", "delta"],
+      [:params, :msg, :payload, :delta],
+      ["params", "msg", "payload", "textDelta"],
+      [:params, :msg, :payload, :textDelta],
+      ["params", "msg", "payload", "outputDelta"],
+      [:params, :msg, :payload, :outputDelta],
+      ["params", "msg", "payload", "text"],
+      [:params, :msg, :payload, :text],
+      ["params", "msg", "payload", "summaryText"],
+      [:params, :msg, :payload, :summaryText],
+      ["params", "msg", "payload", "content"],
+      [:params, :msg, :payload, :content]
+    ]
+  end
+
+  defp extract_first_path(payload, paths), do: Enum.find_value(paths, &map_path(payload, &1))
+
+  defp map_path(data, [key | rest]) when is_map(data) do
+    case fetch_map_key(data, key) do
+      {:ok, value} when rest == [] -> value
+      {:ok, value} -> map_path(value, rest)
+      :error -> nil
+    end
+  end
+
+  defp map_path(_data, _path), do: nil
+
+  defp map_value(map, keys) when is_map(map) and is_list(keys) do
+    Enum.find_value(keys, fn key ->
+      case fetch_map_key(map, key) do
+        {:ok, value} -> value
+        :error -> nil
+      end
+    end)
+  end
+
+  defp map_value(_map, _keys), do: nil
+
+  defp fetch_map_key(map, key) when is_map(map) do
+    case Map.fetch(map, key) do
+      {:ok, value} ->
+        {:ok, value}
+
+      :error ->
+        alternate = alternate_key(key)
+
+        if alternate == key do
+          :error
+        else
+          Map.fetch(map, alternate)
+        end
+    end
+  end
+
+  defp alternate_key(key) when is_binary(key) do
+    String.to_existing_atom(key)
+  rescue
+    ArgumentError -> key
+  end
+
+  defp alternate_key(key) when is_atom(key), do: Atom.to_string(key)
+  defp alternate_key(key), do: key
+
+  defp inline_stream_text(text) when is_binary(text) do
+    text
+    |> String.replace("\n", " ")
+    |> String.replace(~r/\s+/, " ")
+    |> String.trim()
   end
 
   defp codex_app_server_pid_for_update(_existing, %{codex_app_server_pid: pid})
@@ -1665,7 +1903,6 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp extract_token_delta(running_entry, %{event: _, timestamp: _} = update) do
-    running_entry = running_entry || %{}
     usage = extract_token_usage(update)
 
     {

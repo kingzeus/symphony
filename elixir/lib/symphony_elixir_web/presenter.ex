@@ -83,6 +83,7 @@ defmodule SymphonyElixirWeb.Presenter do
         codex_session_logs: []
       },
       recent_events: recent_events_payload(running || blocked),
+      raw_events: raw_events_payload(running || blocked),
       last_error: (blocked && blocked.error) || (retry && retry.error),
       tracked: %{}
     }
@@ -223,6 +224,18 @@ defmodule SymphonyElixirWeb.Presenter do
     |> Enum.reject(&is_nil(&1.at))
   end
 
+  defp raw_events_payload(nil), do: []
+
+  defp raw_events_payload(entry) do
+    case Map.get(entry, :raw_codex_updates) do
+      updates when is_list(updates) ->
+        Enum.map(updates, &json_safe_value/1)
+
+      _ ->
+        []
+    end
+  end
+
   defp codex_updates(entry) do
     case Map.get(entry, :codex_updates) do
       updates when is_list(updates) and updates != [] ->
@@ -255,7 +268,7 @@ defmodule SymphonyElixirWeb.Presenter do
     %{
       at: iso8601(normalized_update.timestamp),
       event: normalized_update.event,
-      message: summarize_message(normalized_update)
+      message: normalized_update.display_message || summarize_message(normalized_update)
     }
   end
 
@@ -263,12 +276,13 @@ defmodule SymphonyElixirWeb.Presenter do
     %{
       event: Map.get(update, :event) || Map.get(update, "event"),
       message: Map.get(update, :message) || Map.get(update, "message"),
-      timestamp: Map.get(update, :timestamp) || Map.get(update, "timestamp")
+      timestamp: Map.get(update, :timestamp) || Map.get(update, "timestamp"),
+      display_message: Map.get(update, :display_message) || Map.get(update, "display_message")
     }
   end
 
   defp normalize_codex_update(update) do
-    %{event: nil, message: update, timestamp: nil}
+    %{event: nil, message: update, timestamp: nil, display_message: nil}
   end
 
   defp execution_payload(entry, recent_events) do
@@ -398,6 +412,35 @@ defmodule SymphonyElixirWeb.Presenter do
   defp contains_any?(text, needles), do: Enum.any?(needles, &String.contains?(text, &1))
   defp present?(value) when is_binary(value), do: String.trim(value) != ""
   defp present?(_value), do: false
+
+  defp json_safe_value(%DateTime{} = datetime), do: iso8601(datetime)
+
+  defp json_safe_value(%NaiveDateTime{} = datetime) do
+    datetime
+    |> NaiveDateTime.truncate(:second)
+    |> NaiveDateTime.to_iso8601()
+  end
+
+  defp json_safe_value(%{} = map) do
+    map
+    |> Enum.map(fn {key, value} -> {json_safe_key(key), json_safe_value(value)} end)
+    |> Map.new()
+  end
+
+  defp json_safe_value(list) when is_list(list), do: Enum.map(list, &json_safe_value/1)
+  defp json_safe_value(value) when is_boolean(value) or is_nil(value), do: value
+  defp json_safe_value(value) when is_atom(value), do: json_safe_atom(value)
+  defp json_safe_value(value) when is_binary(value) or is_integer(value) or is_float(value), do: value
+  defp json_safe_value(value), do: inspect(value)
+
+  defp json_safe_key(key) when is_atom(key), do: Atom.to_string(key)
+  defp json_safe_key(key) when is_binary(key), do: key
+  defp json_safe_key(key), do: to_string(key)
+
+  defp json_safe_atom(nil), do: nil
+  defp json_safe_atom(true), do: true
+  defp json_safe_atom(false), do: false
+  defp json_safe_atom(value), do: Atom.to_string(value)
 
   defp summarize_message(nil), do: nil
   defp summarize_message(message), do: StatusDashboard.humanize_codex_message(message)

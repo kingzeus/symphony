@@ -257,8 +257,9 @@ defmodule SymphonyElixirWeb.DashboardLive do
                 <div class="agent-stage-band">
                   <span class="detail-label">Current stage</span>
                   <strong><%= selected_entry.execution.current_stage %></strong>
-                  <span class="muted">
-                    Last update: <%= selected_entry.last_message || to_string(selected_entry.last_event || "n/a") %>
+                  <span class="muted agent-stage-update">
+                    Last update:
+                    <span class="agent-stage-message"><%= selected_entry.last_message || to_string(selected_entry.last_event || "n/a") %></span>
                   </span>
                 </div>
 
@@ -472,9 +473,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
   end
 
   defp recent_events_for_display(events) when is_list(events) do
-    events
-    |> Enum.reverse()
-    |> Enum.take(8)
+    Enum.take(events, -8)
   end
 
   defp recent_events_for_display(_events), do: []

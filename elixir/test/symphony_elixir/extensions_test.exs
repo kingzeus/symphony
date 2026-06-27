@@ -429,6 +429,7 @@ defmodule SymphonyElixir.ExtensionsTest do
              "blocked" => nil,
              "logs" => %{"codex_session_logs" => []},
              "recent_events" => [],
+             "raw_events" => [],
              "last_error" => nil,
              "tracked" => %{}
            }
@@ -460,6 +461,81 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert %{"queued" => true, "coalesced" => false, "operations" => ["poll", "reconcile"]} =
              json_response(conn, 202)
+  end
+
+  test "phoenix observability api shows merged stream events and raw JSON history" do
+    now = DateTime.utc_now()
+    first_delta_at = DateTime.add(now, -2, :second)
+    second_delta_at = DateTime.add(now, -1, :second)
+
+    raw_updates = [
+      streaming_delta_update("msg-1", "The ", first_delta_at),
+      streaming_delta_update("msg-1", "answer", second_delta_at),
+      streaming_delta_update("msg-2", "Separate", now)
+    ]
+
+    merged_updates = [
+      raw_updates
+      |> Enum.at(1)
+      |> Map.merge(%{
+        display_message: "agent message streaming: The answer",
+        stream_merge: %{
+          key: {"agent message streaming", "msg-1"},
+          label: "agent message streaming",
+          delta: "The answer"
+        }
+      }),
+      raw_updates
+      |> Enum.at(2)
+      |> Map.merge(%{
+        display_message: "agent message streaming: Separate",
+        stream_merge: %{
+          key: {"agent message streaming", "msg-2"},
+          label: "agent message streaming",
+          delta: "Separate"
+        }
+      })
+    ]
+
+    running_entry =
+      static_snapshot()
+      |> Map.fetch!(:running)
+      |> List.first()
+      |> Map.put(:codex_updates, merged_updates)
+      |> Map.put(:raw_codex_updates, raw_updates)
+
+    orchestrator_name = Module.concat(__MODULE__, :StreamingEventsOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: %{static_snapshot() | running: [running_entry]}
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    state_payload = json_response(get(build_conn(), "/api/v1/state"), 200)
+    [running_payload] = state_payload["running"]
+
+    assert running_payload["recent_events"] == [
+             %{
+               "at" => second_delta_at |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+               "event" => "notification",
+               "message" => "agent message streaming: The answer"
+             },
+             %{
+               "at" => now |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+               "event" => "notification",
+               "message" => "agent message streaming: Separate"
+             }
+           ]
+
+    issue_payload = json_response(get(build_conn(), "/api/v1/MT-HTTP"), 200)
+    assert issue_payload["recent_events"] == running_payload["recent_events"]
+
+    assert issue_payload["raw_events"]
+           |> Enum.map(&get_in(&1, ["message", "payload", "params", "msg", "payload", "delta"])) ==
+             ["The ", "answer", "Separate"]
   end
 
   test "phoenix observability api preserves 405, 404, and unavailable behavior" do
@@ -619,6 +695,8 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert selected_html =~ "Agent working"
     assert selected_html =~ "Dispatched to worker"
 
+    event_base_at = DateTime.utc_now()
+
     updated_snapshot =
       put_in(snapshot.running, [
         %{
@@ -642,11 +720,28 @@ defmodule SymphonyElixir.ExtensionsTest do
               }
             }
           },
-          last_codex_timestamp: DateTime.utc_now(),
+          last_codex_timestamp: DateTime.add(event_base_at, 3, :second),
+          codex_updates: [
+            %{
+              event: :notification,
+              timestamp: event_base_at,
+              display_message: "alpha old"
+            },
+            %{
+              event: :notification,
+              timestamp: DateTime.add(event_base_at, 1, :second),
+              display_message: "beta middle"
+            },
+            %{
+              event: :notification,
+              timestamp: DateTime.add(event_base_at, 2, :second),
+              display_message: "gamma new"
+            }
+          ],
           codex_input_tokens: 10,
           codex_output_tokens: 12,
           codex_total_tokens: 22,
-          started_at: DateTime.utc_now()
+          started_at: event_base_at
         }
       ])
 
@@ -660,7 +755,14 @@ defmodule SymphonyElixir.ExtensionsTest do
       render(view) =~ "agent message content streaming: structured update"
     end)
 
-    refute render(view) =~ "javascript:alert"
+    rendered_html = render(view)
+    assert {old_index, _} = :binary.match(rendered_html, "alpha old")
+    assert {middle_index, _} = :binary.match(rendered_html, "beta middle")
+    assert {new_index, _} = :binary.match(rendered_html, "gamma new")
+    assert old_index < middle_index
+    assert middle_index < new_index
+
+    refute rendered_html =~ "javascript:alert"
   end
 
   test "dashboard liveview renders an unavailable state without crashing" do
@@ -802,6 +904,24 @@ defmodule SymphonyElixir.ExtensionsTest do
       ],
       codex_totals: %{input_tokens: 4, output_tokens: 8, total_tokens: 12, seconds_running: 42.5},
       rate_limits: %{"primary" => %{"remaining" => 11}}
+    }
+  end
+
+  defp streaming_delta_update(message_id, delta, timestamp) do
+    %{
+      event: :notification,
+      timestamp: timestamp,
+      message: %{
+        payload: %{
+          "method" => "codex/event/agent_message_delta",
+          "params" => %{
+            "msg" => %{
+              "id" => message_id,
+              "payload" => %{"delta" => delta}
+            }
+          }
+        }
+      }
     }
   end
 

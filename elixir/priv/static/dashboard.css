@@ -486,6 +486,15 @@ pre,
   background: var(--accent-soft);
 }
 
+.agent-stage-update {
+  overflow-wrap: anywhere;
+  line-height: 1.45;
+}
+
+.agent-stage-message {
+  color: var(--ink);
+}
+
 .agent-detail-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
