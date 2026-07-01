@@ -98,7 +98,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
           </p>
         </section>
       <% else %>
-        <section class="metric-grid">
+        <section class="metric-grid issue-metric-grid">
           <article class="metric-card">
             <p class="metric-label">Running</p>
             <p class="metric-value numeric"><%= @payload.counts.running %></p>
@@ -122,7 +122,9 @@ defmodule SymphonyElixirWeb.DashboardLive do
             <p class="metric-value numeric"><%= @payload.counts.blocked %></p>
             <p class="metric-detail">Issues paused for operator input or approval.</p>
           </article>
+        </section>
 
+        <section class="runtime-metric-grid" aria-label="Runtime metrics">
           <article class="metric-card">
             <p class="metric-label">Total tokens</p>
             <p class="metric-value numeric"><%= format_int(@payload.codex_totals.total_tokens) %></p>
@@ -136,17 +138,12 @@ defmodule SymphonyElixirWeb.DashboardLive do
             <p class="metric-value numeric"><%= format_runtime_seconds(total_runtime_seconds(@payload, @now)) %></p>
             <p class="metric-detail">Total Codex runtime across completed and active sessions.</p>
           </article>
-        </section>
 
-        <section class="section-card">
-          <div class="section-header">
-            <div>
-              <h2 class="section-title">Rate limits</h2>
-              <p class="section-copy">Latest upstream rate-limit snapshot, when available.</p>
-            </div>
-          </div>
-
-          <pre class="code-panel"><%= pretty_value(@payload.rate_limits) %></pre>
+          <article class="metric-card rate-limit-card">
+            <p class="metric-label">Rate limits</p>
+            <p class="metric-detail">Latest upstream rate-limit snapshot, when available.</p>
+            <pre class="code-panel runtime-code-panel"><%= pretty_value(@payload.rate_limits) %></pre>
+          </article>
         </section>
 
         <section class="section-card">
@@ -605,9 +602,15 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   defp format_runtime_seconds(seconds) when is_number(seconds) do
     whole_seconds = max(trunc(seconds), 0)
-    mins = div(whole_seconds, 60)
+    hours = div(whole_seconds, 3_600)
+    mins = whole_seconds |> rem(3_600) |> div(60)
     secs = rem(whole_seconds, 60)
-    "#{mins}m #{secs}s"
+
+    if hours > 0 do
+      "#{hours}h #{mins}m #{secs}s"
+    else
+      "#{mins}m #{secs}s"
+    end
   end
 
   defp runtime_seconds_from_started_at(%DateTime{} = started_at, %DateTime{} = now) do

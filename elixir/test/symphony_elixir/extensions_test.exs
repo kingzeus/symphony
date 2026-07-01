@@ -655,6 +655,8 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert dashboard_css =~ "[data-phx-main].phx-connected .status-badge-live"
     assert dashboard_css =~ "[data-phx-main].phx-connected .status-badge-offline"
     assert dashboard_css =~ ".agent-detail-panel"
+    assert dashboard_css =~ ".runtime-metric-grid"
+    assert dashboard_css =~ ".runtime-code-panel"
     assert dashboard_css =~ "text-decoration-thickness: 1px"
 
     favicon_conn = get(build_conn(), "/favicon.png")
@@ -803,6 +805,61 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert middle_index < new_index
 
     refute rendered_html =~ "javascript:alert"
+  end
+
+  test "dashboard groups runtime metrics separately from issue metrics and formats hours" do
+    orchestrator_name = Module.concat(__MODULE__, :RuntimeMetricsDashboardOrchestrator)
+
+    snapshot =
+      static_snapshot()
+      |> Map.merge(%{
+        running: [],
+        retrying: [],
+        blocked: [],
+        waiting: [],
+        codex_totals: %{
+          input_tokens: 1_000,
+          output_tokens: 200,
+          total_tokens: 1_200,
+          seconds_running: 3_661
+        },
+        rate_limits: %{"primary" => %{"remaining" => 11}}
+      })
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: snapshot
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    {:ok, _view, html} = live(build_conn(), "/")
+
+    issue_marker = ~r/<section[^>]*class="metric-grid issue-metric-grid"[^>]*>/
+    runtime_marker = ~r/<section[^>]*class="runtime-metric-grid"[^>]*>/
+
+    assert html =~ issue_marker
+    assert html =~ runtime_marker
+
+    assert [_, after_issue_marker] = Regex.split(issue_marker, html, parts: 2)
+    assert [issue_metrics, after_runtime_marker] = Regex.split(runtime_marker, after_issue_marker, parts: 2)
+
+    [runtime_metrics | _rest] = String.split(after_runtime_marker, ~s(<section class="section-card">), parts: 2)
+
+    assert issue_metrics =~ "Running"
+    assert issue_metrics =~ "Retrying"
+    assert issue_metrics =~ "Waiting"
+    assert issue_metrics =~ "Blocked"
+    refute issue_metrics =~ "Total tokens"
+    refute issue_metrics =~ "Rate limits"
+
+    assert runtime_metrics =~ "Total tokens"
+    assert runtime_metrics =~ "Runtime"
+    assert runtime_metrics =~ "Rate limits"
+    assert runtime_metrics =~ "1h 1m 1s"
+    assert runtime_metrics =~ "1,200"
+    assert runtime_metrics =~ "primary"
   end
 
   test "dashboard liveview renders an unavailable state without crashing" do
