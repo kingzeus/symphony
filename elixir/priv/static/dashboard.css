@@ -247,6 +247,17 @@ pre,
   grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
+.dashboard-section-grid {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: stretch;
+}
+
+.dashboard-section-grid > .section-card {
+  height: 100%;
+}
+
 .metric-card {
   border-radius: 22px;
   padding: 1rem 1.05rem 1.1rem;
@@ -313,6 +324,10 @@ pre,
 .data-table-running {
   table-layout: fixed;
   min-width: 980px;
+}
+
+.data-table-compact {
+  min-width: 680px;
 }
 
 .data-table th {
@@ -408,6 +423,16 @@ pre,
   letter-spacing: -0.01em;
 }
 
+.issue-title {
+  color: var(--muted);
+  font-size: 0.86rem;
+  line-height: 1.35;
+  max-width: 18rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .issue-id-link {
   color: inherit;
   text-decoration: underline;
@@ -419,6 +444,62 @@ pre,
 .issue-link {
   color: var(--muted);
   font-size: 0.86rem;
+}
+
+.backlog-list {
+  display: grid;
+  gap: 0.78rem;
+  margin-top: 1rem;
+}
+
+.backlog-item {
+  display: grid;
+  gap: 0.62rem;
+  padding: 0.8rem 0;
+  border-top: 1px solid var(--line);
+}
+
+.backlog-item:first-child {
+  border-top: 0;
+  padding-top: 0;
+}
+
+.backlog-item-main {
+  display: grid;
+  gap: 0.26rem;
+  min-width: 0;
+}
+
+.backlog-title-line {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.backlog-title-line .state-badge {
+  min-height: 1.55rem;
+  padding: 0.24rem 0.55rem;
+  font-size: 0.76rem;
+}
+
+.backlog-title {
+  max-width: 100%;
+}
+
+.backlog-meta {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem 0.6rem;
+  min-width: 0;
+  flex-wrap: wrap;
+  color: var(--muted);
+  font-size: 0.84rem;
+}
+
+.backlog-meta > * {
+  min-width: 0;
 }
 
 .muted {
@@ -444,6 +525,12 @@ pre,
 .empty-state {
   margin: 1rem 0 0;
   color: var(--muted);
+}
+
+.list-summary {
+  margin: 0.85rem 0 0;
+  color: var(--muted);
+  font-size: 0.86rem;
 }
 
 .empty-state-compact {
@@ -664,6 +751,10 @@ pre,
   }
 
   .runtime-metric-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .dashboard-section-grid {
     grid-template-columns: 1fr;
   }
 

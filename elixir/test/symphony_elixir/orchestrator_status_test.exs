@@ -1065,6 +1065,87 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
            ] = snapshot.waiting
   end
 
+  test "orchestrator snapshot includes routable tracker backlog issues" do
+    previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+    created_at = DateTime.add(DateTime.utc_now(), -3_600, :second)
+    updated_at = DateTime.utc_now()
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_required_labels: ["symphony"],
+      poll_interval_ms: 30_000
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+
+    orchestrator_name = Module.concat(__MODULE__, :BacklogIssueOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    backlog_issue = %Issue{
+      id: "issue-backlog",
+      identifier: "MT-BACKLOG",
+      title: "Queued backlog work",
+      priority: 2,
+      state: "Backlog",
+      labels: ["symphony", "dashboard"],
+      assignee_id: "worker-1",
+      url: "https://example.org/issues/MT-BACKLOG",
+      created_at: created_at,
+      updated_at: updated_at
+    }
+
+    unrouted_issue = %Issue{
+      id: "issue-unrouted-backlog",
+      identifier: "MT-NOPE",
+      title: "Not routed",
+      state: "Backlog",
+      labels: [],
+      url: "https://example.org/issues/MT-NOPE",
+      created_at: created_at,
+      updated_at: updated_at
+    }
+
+    on_exit(fn ->
+      restore_app_env(:memory_tracker_issues, previous_memory_issues)
+
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [
+      backlog_issue,
+      unrouted_issue
+    ])
+
+    send(pid, :run_poll_cycle)
+
+    snapshot =
+      wait_for_snapshot(
+        pid,
+        fn
+          %{backlog: [%{identifier: "MT-BACKLOG"}]} -> true
+          _ -> false
+        end,
+        1_000
+      )
+
+    assert [
+             %{
+               issue_id: "issue-backlog",
+               identifier: "MT-BACKLOG",
+               issue_url: "https://example.org/issues/MT-BACKLOG",
+               title: "Queued backlog work",
+               priority: 2,
+               state: "Backlog",
+               labels: ["symphony", "dashboard"],
+               assignee_id: "worker-1",
+               created_at: ^created_at,
+               updated_at: ^updated_at
+             }
+           ] = snapshot.backlog
+  end
+
   test "orchestrator restarts stalled workers with retry backoff" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_api_token: nil,

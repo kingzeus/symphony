@@ -32,6 +32,7 @@ defmodule SymphonyElixir.Orchestrator do
   }
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
+  @backlog_state_names ["Backlog"]
   @empty_codex_totals %{
     input_tokens: 0,
     output_tokens: 0,
@@ -52,6 +53,7 @@ defmodule SymphonyElixir.Orchestrator do
       :tick_timer_ref,
       :tick_token,
       running: %{},
+      backlog: %{},
       waiting: %{},
       completed: MapSet.new(),
       claimed: MapSet.new(),
@@ -272,9 +274,18 @@ defmodule SymphonyElixir.Orchestrator do
 
     with :ok <- Config.validate!(),
          state <- refresh_waiting_issues(state),
-         {:ok, issues} <- Tracker.fetch_candidate_issues(),
-         true <- available_slots(state) > 0 do
-      choose_issues(issues, state)
+         state <- refresh_backlog_issues(state),
+         {:ok, issues} <- Tracker.fetch_candidate_issues() do
+      sorted_issues = sort_issues_for_dispatch(issues)
+
+      state =
+        if available_slots(state) > 0 do
+          choose_issues(sorted_issues, state)
+        else
+          state
+        end
+
+      merge_candidate_backlog_issues(state, sorted_issues)
     else
       {:error, :missing_linear_api_token} ->
         Logger.error("Linear API token missing in WORKFLOW.md")
@@ -312,9 +323,6 @@ defmodule SymphonyElixir.Orchestrator do
 
       {:error, reason} ->
         Logger.error("Failed to fetch from Linear: #{inspect(reason)}")
-        state
-
-      false ->
         state
     end
   end
@@ -607,6 +615,47 @@ defmodule SymphonyElixir.Orchestrator do
     |> Map.new()
   end
 
+  defp refresh_backlog_issues(%State{} = state) do
+    case Tracker.fetch_issues_by_states(@backlog_state_names) do
+      {:ok, issues} ->
+        apply_tracker_backlog_issues(state, issues)
+
+      {:error, reason} ->
+        Logger.debug("Failed to fetch backlog issue states: #{inspect(reason)}; keeping backlog snapshot")
+        state
+    end
+  end
+
+  defp apply_tracker_backlog_issues(%State{} = state, issues) when is_list(issues) do
+    terminal_states = terminal_state_set()
+
+    backlog =
+      issues
+      |> Enum.filter(&tracker_backlog_issue?(&1, state, terminal_states))
+      |> sort_issues_for_dispatch()
+      |> Enum.map(fn issue -> {issue.id, backlog_issue_metadata(issue)} end)
+      |> Map.new()
+
+    %{state | backlog: backlog}
+  end
+
+  defp tracker_backlog_issue?(
+         %Issue{id: issue_id, state: state_name} = issue,
+         %State{} = state,
+         terminal_states
+       )
+       when is_binary(issue_id) and is_binary(state_name) do
+    issue_routable?(issue) and
+      !terminal_issue_state?(state_name, terminal_states) and
+      !MapSet.member?(state.claimed, issue_id) and
+      !Map.has_key?(state.running, issue_id) and
+      !Map.has_key?(state.blocked, issue_id) and
+      !Map.has_key?(state.retry_attempts, issue_id) and
+      !Map.has_key?(state.waiting, issue_id)
+  end
+
+  defp tracker_backlog_issue?(_issue, _state, _terminal_states), do: false
+
   defp terminate_running_issue(%State{} = state, issue_id, cleanup_workspace) do
     case Map.get(state.running, issue_id) do
       nil ->
@@ -628,7 +677,8 @@ defmodule SymphonyElixir.Orchestrator do
             claimed: MapSet.delete(state.claimed, issue_id),
             blocked: Map.delete(state.blocked, issue_id),
             retry_attempts: Map.delete(state.retry_attempts, issue_id),
-            waiting: Map.delete(state.waiting, issue_id)
+            waiting: Map.delete(state.waiting, issue_id),
+            backlog: Map.delete(state.backlog, issue_id)
         }
 
       _ ->
@@ -829,7 +879,8 @@ defmodule SymphonyElixir.Orchestrator do
       | running: Map.delete(state.running, issue_id),
         retry_attempts: Map.delete(state.retry_attempts, issue_id),
         claimed: MapSet.put(state.claimed, issue_id),
-        blocked: Map.put(state.blocked, issue_id, blocked_entry)
+        blocked: Map.put(state.blocked, issue_id, blocked_entry),
+        backlog: Map.delete(state.backlog, issue_id)
     }
   end
 
@@ -885,6 +936,38 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp should_dispatch_issue?(_issue, _state, _active_states, _terminal_states), do: false
+
+  defp merge_candidate_backlog_issues(%State{} = state, issues) when is_list(issues) do
+    active_states = active_state_set()
+    terminal_states = terminal_state_set()
+
+    candidate_backlog =
+      issues
+      |> Enum.filter(&backlog_issue?(&1, state, active_states, terminal_states))
+      |> sort_issues_for_dispatch()
+      |> Enum.map(fn issue -> {issue.id, backlog_issue_metadata(issue)} end)
+      |> Map.new()
+
+    %{state | backlog: Map.merge(state.backlog, candidate_backlog)}
+  end
+
+  defp backlog_issue?(
+         %Issue{id: issue_id} = issue,
+         %State{} = state,
+         active_states,
+         terminal_states
+       )
+       when is_binary(issue_id) do
+    candidate_issue?(issue, active_states, terminal_states) and
+      !todo_issue_blocked_by_non_terminal?(issue, terminal_states) and
+      !MapSet.member?(state.claimed, issue_id) and
+      !Map.has_key?(state.running, issue_id) and
+      !Map.has_key?(state.blocked, issue_id) and
+      !Map.has_key?(state.retry_attempts, issue_id) and
+      !Map.has_key?(state.waiting, issue_id)
+  end
+
+  defp backlog_issue?(_issue, _state, _active_states, _terminal_states), do: false
 
   defp state_slots_available?(%Issue{state: issue_state}, running) when is_map(running) do
     limit = Config.max_concurrent_agents_for_state(issue_state)
@@ -948,6 +1031,22 @@ defmodule SymphonyElixir.Orchestrator do
       issue: issue,
       issue_url: issue.url,
       state: issue.state,
+      updated_at: issue.updated_at
+    }
+  end
+
+  defp backlog_issue_metadata(%Issue{} = issue) do
+    %{
+      issue_id: issue.id,
+      identifier: issue.identifier,
+      title: issue.title,
+      priority: issue.priority,
+      issue: issue,
+      issue_url: issue.url,
+      state: issue.state,
+      labels: issue.labels,
+      assignee_id: issue.assignee_id,
+      created_at: issue.created_at,
       updated_at: issue.updated_at
     }
   end
@@ -1114,7 +1213,8 @@ defmodule SymphonyElixir.Orchestrator do
           | running: running,
             claimed: MapSet.put(state.claimed, issue.id),
             retry_attempts: Map.delete(state.retry_attempts, issue.id),
-            waiting: Map.delete(state.waiting, issue.id)
+            waiting: Map.delete(state.waiting, issue.id),
+            backlog: Map.delete(state.backlog, issue.id)
         }
 
       {:error, reason} ->
@@ -1195,7 +1295,8 @@ defmodule SymphonyElixir.Orchestrator do
             error: error,
             worker_host: worker_host,
             workspace_path: workspace_path
-          })
+          }),
+        backlog: Map.delete(state.backlog, issue_id)
     }
   end
 
@@ -1324,7 +1425,8 @@ defmodule SymphonyElixir.Orchestrator do
       | claimed: MapSet.delete(state.claimed, issue_id),
         blocked: Map.delete(state.blocked, issue_id),
         retry_attempts: Map.delete(state.retry_attempts, issue_id),
-        waiting: Map.delete(state.waiting, issue_id)
+        waiting: Map.delete(state.waiting, issue_id),
+        backlog: Map.delete(state.backlog, issue_id)
     }
   end
 
@@ -1551,6 +1653,24 @@ defmodule SymphonyElixir.Orchestrator do
         }
       end)
 
+    backlog =
+      state.backlog
+      |> Enum.map(fn {issue_id, metadata} ->
+        %{
+          issue_id: issue_id,
+          identifier: Map.get(metadata, :identifier),
+          issue_url: backlog_issue_url(metadata),
+          title: Map.get(metadata, :title),
+          priority: Map.get(metadata, :priority),
+          state: backlog_issue_state(metadata),
+          labels: Map.get(metadata, :labels, []),
+          assignee_id: Map.get(metadata, :assignee_id),
+          created_at: Map.get(metadata, :created_at),
+          updated_at: Map.get(metadata, :updated_at)
+        }
+      end)
+      |> Enum.sort_by(&backlog_entry_sort_key/1)
+
     blocked =
       state.blocked
       |> Enum.map(fn {issue_id, metadata} ->
@@ -1591,6 +1711,7 @@ defmodule SymphonyElixir.Orchestrator do
      %{
        running: running,
        retrying: retrying,
+       backlog: backlog,
        blocked: blocked,
        waiting: waiting,
        codex_totals: state.codex_totals,
@@ -1631,6 +1752,25 @@ defmodule SymphonyElixir.Orchestrator do
   defp waiting_issue_url(%{issue: %Issue{url: url}}), do: url
   defp waiting_issue_url(%{issue_url: url}), do: url
   defp waiting_issue_url(_metadata), do: nil
+
+  defp backlog_issue_state(%{issue: %Issue{state: state}}), do: state
+  defp backlog_issue_state(%{state: state}), do: state
+  defp backlog_issue_state(_metadata), do: nil
+
+  defp backlog_issue_url(%{issue: %Issue{url: url}}), do: url
+  defp backlog_issue_url(%{issue_url: url}), do: url
+  defp backlog_issue_url(_metadata), do: nil
+
+  defp backlog_entry_sort_key(entry) when is_map(entry) do
+    {
+      priority_rank(Map.get(entry, :priority)),
+      date_time_sort_key(Map.get(entry, :created_at)),
+      Map.get(entry, :identifier) || Map.get(entry, :issue_id) || ""
+    }
+  end
+
+  defp date_time_sort_key(%DateTime{} = datetime), do: DateTime.to_unix(datetime, :microsecond)
+  defp date_time_sort_key(_datetime), do: 9_223_372_036_854_775_807
 
   defp integrate_codex_update(running_entry, %{event: event, timestamp: timestamp} = update) do
     summarized_update = summarize_codex_update(update)

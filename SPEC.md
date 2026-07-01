@@ -266,6 +266,8 @@ Fields:
 - `poll_interval_ms` (current effective poll interval)
 - `max_concurrent_agents` (current effective global concurrency limit)
 - `running` (map `issue_id -> running entry`)
+- `backlog` (map `issue_id -> backlog entry for tracker backlog-state issues and routable
+  candidate issues not currently running/retrying/waiting/blocked/claimed)
 - `claimed` (set of issue IDs reserved/running/retrying)
 - `retry_attempts` (map `issue_id -> RetryEntry`)
 - `completed` (set of issue IDs; bookkeeping only, not dispatch gating)
@@ -1298,6 +1300,8 @@ SHOULD return:
 
 - `running` (list of running session rows)
 - each running row SHOULD include `turn_count`
+- `backlog` (list of tracker backlog-state issue rows and routable candidate issue rows that are
+  not currently dispatched)
 - `retrying` (list of retry queue rows)
 - session and retry rows SHOULD include the tracker-provided issue URL when available
 - `codex_totals`
@@ -1412,9 +1416,24 @@ Minimum endpoints:
     {
       "generated_at": "2026-02-24T20:15:30Z",
       "counts": {
+        "backlog": 4,
         "running": 2,
         "retrying": 1
       },
+      "backlog": [
+        {
+          "issue_id": "ghi789",
+          "issue_identifier": "MT-651",
+          "issue_url": "https://tracker.example/issues/MT-651",
+          "title": "Queued follow-up work",
+          "priority": 2,
+          "state": "Todo",
+          "labels": ["symphony", "dashboard"],
+          "assignee_id": "worker-1",
+          "created_at": "2026-02-24T19:00:00Z",
+          "updated_at": "2026-02-24T20:00:00Z"
+        }
+      ],
       "running": [
         {
           "issue_id": "abc123",
@@ -1486,6 +1505,7 @@ Minimum endpoints:
         }
       },
       "retry": null,
+      "backlog": null,
       "logs": {
         "codex_session_logs": [
           {

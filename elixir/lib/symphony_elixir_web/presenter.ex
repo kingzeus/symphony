@@ -14,11 +14,13 @@ defmodule SymphonyElixirWeb.Presenter do
         %{
           generated_at: generated_at,
           counts: %{
+            backlog: length(Map.get(snapshot, :backlog, [])),
             running: length(snapshot.running),
             retrying: length(snapshot.retrying),
             blocked: length(Map.get(snapshot, :blocked, [])),
             waiting: length(Map.get(snapshot, :waiting, []))
           },
+          backlog: Enum.map(Map.get(snapshot, :backlog, []), &backlog_entry_payload/1),
           running: Enum.map(snapshot.running, &running_entry_payload/1),
           retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
           blocked: Enum.map(Map.get(snapshot, :blocked, []), &blocked_entry_payload/1),
@@ -41,13 +43,14 @@ defmodule SymphonyElixirWeb.Presenter do
       %{} = snapshot ->
         running = Enum.find(snapshot.running, &(&1.identifier == issue_identifier))
         retry = Enum.find(snapshot.retrying, &(&1.identifier == issue_identifier))
+        backlog = Enum.find(Map.get(snapshot, :backlog, []), &(&1.identifier == issue_identifier))
         blocked = Enum.find(Map.get(snapshot, :blocked, []), &(&1.identifier == issue_identifier))
         waiting = Enum.find(Map.get(snapshot, :waiting, []), &(&1.identifier == issue_identifier))
 
-        if is_nil(running) and is_nil(retry) and is_nil(blocked) and is_nil(waiting) do
+        if is_nil(running) and is_nil(retry) and is_nil(backlog) and is_nil(blocked) and is_nil(waiting) do
           {:error, :issue_not_found}
         else
-          {:ok, issue_payload_body(issue_identifier, running, retry, blocked, waiting)}
+          {:ok, issue_payload_body(issue_identifier, running, retry, backlog, blocked, waiting)}
         end
 
       _ ->
@@ -66,8 +69,8 @@ defmodule SymphonyElixirWeb.Presenter do
     end
   end
 
-  defp issue_payload_body(issue_identifier, running, retry, blocked, waiting) do
-    entries = issue_entries(running, retry, blocked, waiting)
+  defp issue_payload_body(issue_identifier, running, retry, backlog, blocked, waiting) do
+    entries = issue_entries(running, retry, backlog, blocked, waiting)
 
     %{
       issue_identifier: issue_identifier,
@@ -77,6 +80,7 @@ defmodule SymphonyElixirWeb.Presenter do
       attempts: retry_attempts_payload(retry),
       running: optional_payload(running, &running_issue_payload/1),
       retry: optional_payload(retry, &retry_issue_payload/1),
+      backlog: optional_payload(backlog, &backlog_issue_payload/1),
       blocked: optional_payload(blocked, &blocked_issue_payload/1),
       waiting: optional_payload(waiting, &waiting_issue_payload/1),
       logs: %{
@@ -89,12 +93,13 @@ defmodule SymphonyElixirWeb.Presenter do
     }
   end
 
-  defp issue_entries(running, retry, blocked, waiting) do
-    %{running: running, retry: retry, blocked: blocked, waiting: waiting}
+  defp issue_entries(running, retry, backlog, blocked, waiting) do
+    %{running: running, retry: retry, backlog: backlog, blocked: blocked, waiting: waiting}
   end
 
   defp issue_id_from_entries(%{running: %{issue_id: issue_id}}), do: issue_id
   defp issue_id_from_entries(%{retry: %{issue_id: issue_id}}), do: issue_id
+  defp issue_id_from_entries(%{backlog: %{issue_id: issue_id}}), do: issue_id
   defp issue_id_from_entries(%{blocked: %{issue_id: issue_id}}), do: issue_id
   defp issue_id_from_entries(%{waiting: %{issue_id: issue_id}}), do: issue_id
   defp issue_id_from_entries(_entries), do: nil
@@ -105,6 +110,7 @@ defmodule SymphonyElixirWeb.Presenter do
 
   defp issue_status(%{running: running}) when not is_nil(running), do: "running"
   defp issue_status(%{retry: retry}) when not is_nil(retry), do: "retrying"
+  defp issue_status(%{backlog: backlog}) when not is_nil(backlog), do: "backlog"
   defp issue_status(%{blocked: blocked}) when not is_nil(blocked), do: "blocked"
   defp issue_status(_entries), do: "waiting"
 
@@ -151,6 +157,21 @@ defmodule SymphonyElixirWeb.Presenter do
       error: entry.error,
       worker_host: Map.get(entry, :worker_host),
       workspace_path: Map.get(entry, :workspace_path)
+    }
+  end
+
+  defp backlog_entry_payload(entry) do
+    %{
+      issue_id: entry.issue_id,
+      issue_identifier: entry.identifier,
+      issue_url: Map.get(entry, :issue_url),
+      title: Map.get(entry, :title),
+      priority: Map.get(entry, :priority),
+      state: entry.state,
+      labels: normalize_labels(Map.get(entry, :labels, [])),
+      assignee_id: Map.get(entry, :assignee_id),
+      created_at: iso8601(Map.get(entry, :created_at)),
+      updated_at: iso8601(Map.get(entry, :updated_at))
     }
   end
 
@@ -215,6 +236,19 @@ defmodule SymphonyElixirWeb.Presenter do
     }
   end
 
+  defp backlog_issue_payload(backlog) do
+    %{
+      issue_url: Map.get(backlog, :issue_url),
+      title: Map.get(backlog, :title),
+      priority: Map.get(backlog, :priority),
+      state: backlog.state,
+      labels: normalize_labels(Map.get(backlog, :labels, [])),
+      assignee_id: Map.get(backlog, :assignee_id),
+      created_at: iso8601(Map.get(backlog, :created_at)),
+      updated_at: iso8601(Map.get(backlog, :updated_at))
+    }
+  end
+
   defp blocked_issue_payload(blocked) do
     %{
       worker_host: Map.get(blocked, :worker_host),
@@ -260,7 +294,7 @@ defmodule SymphonyElixirWeb.Presenter do
   end
 
   defp ordered_entry_values(entries) do
-    Enum.map([:running, :retry, :blocked, :waiting], &Map.get(entries, &1))
+    Enum.map([:running, :retry, :backlog, :blocked, :waiting], &Map.get(entries, &1))
   end
 
   defp entry_value(nil, _field), do: nil
@@ -273,6 +307,12 @@ defmodule SymphonyElixirWeb.Presenter do
   defp last_error(%{blocked: %{error: error}}) when not is_nil(error), do: error
   defp last_error(%{retry: %{error: error}}), do: error
   defp last_error(_entries), do: nil
+
+  defp normalize_labels(labels) when is_list(labels) do
+    Enum.filter(labels, &is_binary/1)
+  end
+
+  defp normalize_labels(_labels), do: []
 
   defp recent_events_payload(nil), do: []
 

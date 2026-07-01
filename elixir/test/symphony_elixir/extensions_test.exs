@@ -343,7 +343,21 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert state_payload == %{
              "generated_at" => state_payload["generated_at"],
-             "counts" => %{"running" => 1, "retrying" => 1, "blocked" => 1, "waiting" => 1},
+             "counts" => %{"backlog" => 1, "running" => 1, "retrying" => 1, "blocked" => 1, "waiting" => 1},
+             "backlog" => [
+               %{
+                 "issue_id" => "issue-backlog",
+                 "issue_identifier" => "MT-BACKLOG",
+                 "issue_url" => "https://example.org/issues/MT-BACKLOG",
+                 "title" => "Queued dashboard backlog work",
+                 "priority" => 2,
+                 "state" => "Backlog",
+                 "labels" => ["symphony", "dashboard", "ops", "ui"],
+                 "assignee_id" => "worker-1",
+                 "created_at" => state_payload["backlog"] |> List.first() |> Map.fetch!("created_at"),
+                 "updated_at" => state_payload["backlog"] |> List.first() |> Map.fetch!("updated_at")
+               }
+             ],
              "running" => [
                %{
                  "issue_id" => "issue-http",
@@ -437,6 +451,7 @@ defmodule SymphonyElixir.ExtensionsTest do
                "execution" => expected_execution
              },
              "retry" => nil,
+             "backlog" => nil,
              "blocked" => nil,
              "waiting" => nil,
              "logs" => %{"codex_session_logs" => []},
@@ -457,6 +472,22 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert %{"status" => "retrying", "retry" => %{"attempt" => 2, "error" => "boom"}} =
              json_response(conn, 200)
+
+    conn = get(build_conn(), "/api/v1/MT-BACKLOG")
+
+    assert %{
+             "status" => "backlog",
+             "backlog" => %{
+               "title" => "Queued dashboard backlog work",
+               "priority" => 2,
+               "state" => "Backlog",
+               "labels" => ["symphony", "dashboard", "ops", "ui"],
+               "assignee_id" => "worker-1",
+               "issue_url" => "https://example.org/issues/MT-BACKLOG"
+             },
+             "recent_events" => [],
+             "raw_events" => []
+           } = json_response(conn, 200)
 
     conn = get(build_conn(), "/api/v1/MT-BLOCKED")
 
@@ -657,6 +688,12 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert dashboard_css =~ ".agent-detail-panel"
     assert dashboard_css =~ ".runtime-metric-grid"
     assert dashboard_css =~ ".runtime-code-panel"
+    assert dashboard_css =~ ".dashboard-section-grid"
+    assert dashboard_css =~ ".dashboard-section-grid > .section-card"
+    assert dashboard_css =~ "align-items: stretch"
+    assert dashboard_css =~ ".data-table-compact"
+    assert dashboard_css =~ ".backlog-list"
+    assert dashboard_css =~ ".backlog-title-line"
     assert dashboard_css =~ "text-decoration-thickness: 1px"
 
     favicon_conn = get(build_conn(), "/favicon.png")
@@ -695,22 +732,30 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     {:ok, view, html} = live(build_conn(), "/")
     assert html =~ "Operations Dashboard"
+    assert html =~ "MT-BACKLOG"
     assert html =~ "MT-HTTP"
     assert html =~ "MT-RETRY"
     assert html =~ "MT-BLOCKED"
     assert html =~ "MT-WAIT"
+    assert html =~ ~s(href="https://example.org/issues/MT-BACKLOG")
     assert html =~ ~s(href="https://example.org/issues/MT-HTTP")
     assert html =~ ~s(href="https://example.org/issues/MT-RETRY")
     assert html =~ ~s(href="https://example.org/issues/MT-BLOCKED")
     assert html =~ ~s(href="https://example.org/issues/MT-WAIT")
+    assert html =~ ~s(href="/api/v1/MT-BACKLOG?pretty=1")
     assert html =~ ~s(href="/api/v1/MT-HTTP?pretty=1")
     assert html =~ ~s(href="/api/v1/MT-RETRY?pretty=1")
     assert html =~ ~s(href="/api/v1/MT-BLOCKED?pretty=1")
     assert html =~ ~s(href="/api/v1/MT-WAIT?pretty=1")
+    assert html =~ ~s(aria-label="Open MT-BACKLOG in the issue tracker")
     assert html =~ ~s(aria-label="Open MT-HTTP in the issue tracker")
     assert html =~ "rendered"
     assert html =~ "turn blocked: waiting for user input"
     assert html =~ "Waiting sessions"
+    assert html =~ "Backlog"
+    assert html =~ ~s(class="backlog-list")
+    assert html =~ ~s(class="backlog-title-line")
+    assert html =~ "Queued dashboard backlog work"
     assert html =~ "Human Review"
     assert html =~ "Runtime"
     assert html =~ "Live"
@@ -814,6 +859,7 @@ defmodule SymphonyElixir.ExtensionsTest do
       static_snapshot()
       |> Map.merge(%{
         running: [],
+        backlog: [],
         retrying: [],
         blocked: [],
         waiting: [],
@@ -848,6 +894,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     [runtime_metrics | _rest] = String.split(after_runtime_marker, ~s(<section class="section-card">), parts: 2)
 
     assert issue_metrics =~ "Running"
+    assert issue_metrics =~ "Backlog"
     assert issue_metrics =~ "Retrying"
     assert issue_metrics =~ "Waiting"
     assert issue_metrics =~ "Blocked"
@@ -907,7 +954,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     response = Req.get!("http://127.0.0.1:#{port}/api/v1/state")
     assert response.status == 200
-    assert response.body["counts"] == %{"running" => 1, "retrying" => 1, "blocked" => 1, "waiting" => 1}
+    assert response.body["counts"] == %{"backlog" => 1, "running" => 1, "retrying" => 1, "blocked" => 1, "waiting" => 1}
 
     dashboard_css = Req.get!("http://127.0.0.1:#{port}/dashboard.css")
     assert dashboard_css.status == 200
@@ -951,6 +998,20 @@ defmodule SymphonyElixir.ExtensionsTest do
 
   defp static_snapshot do
     %{
+      backlog: [
+        %{
+          issue_id: "issue-backlog",
+          identifier: "MT-BACKLOG",
+          issue_url: "https://example.org/issues/MT-BACKLOG",
+          title: "Queued dashboard backlog work",
+          priority: 2,
+          state: "Backlog",
+          labels: ["symphony", "dashboard", "ops", "ui"],
+          assignee_id: "worker-1",
+          created_at: DateTime.add(DateTime.utc_now(), -3_600, :second),
+          updated_at: DateTime.utc_now()
+        }
+      ],
       running: [
         %{
           issue_id: "issue-http",

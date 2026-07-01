@@ -6,6 +6,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
   use Phoenix.LiveView, layout: {SymphonyElixirWeb.Layouts, :app}
 
   alias SymphonyElixirWeb.{Endpoint, ObservabilityPubSub, Presenter}
+  @backlog_display_limit 10
   @runtime_tick_ms 1_000
 
   @impl true
@@ -99,6 +100,12 @@ defmodule SymphonyElixirWeb.DashboardLive do
         </section>
       <% else %>
         <section class="metric-grid issue-metric-grid">
+          <article class="metric-card">
+            <p class="metric-label">Backlog</p>
+            <p class="metric-value numeric"><%= @payload.counts.backlog %></p>
+            <p class="metric-detail">Tracker backlog and queued dispatch candidates.</p>
+          </article>
+
           <article class="metric-card">
             <p class="metric-label">Running</p>
             <p class="metric-value numeric"><%= @payload.counts.running %></p>
@@ -326,161 +333,206 @@ defmodule SymphonyElixirWeb.DashboardLive do
           <% end %>
         </section>
 
-        <section class="section-card">
-          <div class="section-header">
-            <div>
-              <h2 class="section-title">Waiting sessions</h2>
-              <p class="section-copy">Issues in manual review or other configured waiting states.</p>
+        <div class="dashboard-section-grid">
+          <section class="section-card">
+            <div class="section-header">
+              <div>
+                <h2 class="section-title">Backlog</h2>
+                <p class="section-copy">Tracker backlog issues plus routable candidates waiting for dispatch.</p>
+              </div>
             </div>
-          </div>
 
-          <%= if @payload.waiting == [] do %>
-            <p class="empty-state">No issues are waiting for manual review.</p>
-          <% else %>
-            <div class="table-wrap">
-              <table class="data-table" style="min-width: 700px;">
-                <thead>
-                  <tr>
-                    <th>Issue</th>
-                    <th>State</th>
-                    <th>Updated at</th>
-                    <th>Workspace</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr :for={entry <- @payload.waiting}>
-                    <td>
-                      <div class="issue-stack">
-                        <.issue_identifier identifier={entry.issue_identifier} url={entry.issue_url} />
-                        <a class="issue-link" href={json_details_path(entry.issue_identifier)}>JSON details</a>
-                      </div>
-                    </td>
-                    <td>
-                      <span class={state_badge_class(entry.state || "Waiting")}>
-                        <%= entry.state || "Waiting" %>
+            <%= if @payload.backlog == [] do %>
+              <p class="empty-state">No backlog issues.</p>
+            <% else %>
+              <%= if backlog_overflow_count(@payload.backlog) > 0 do %>
+                <p class="list-summary">
+                  Showing <%= backlog_display_limit() %> of <%= length(@payload.backlog) %>
+                </p>
+              <% end %>
+
+              <div class="backlog-list">
+                <article class="backlog-item" :for={entry <- backlog_for_display(@payload.backlog)}>
+                  <div class="backlog-item-main">
+                    <div class="backlog-title-line">
+                      <.issue_identifier identifier={entry.issue_identifier} url={entry.issue_url} />
+                      <span class={state_badge_class(entry.state || "Backlog")}>
+                        <%= entry.state || "Backlog" %>
                       </span>
-                    </td>
-                    <td class="mono"><%= entry.updated_at || "n/a" %></td>
-                    <td class="mono"><%= entry.workspace_path || "n/a" %></td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-          <% end %>
-        </section>
+                    </div>
+                    <span class="issue-title backlog-title"><%= entry.title || "Untitled issue" %></span>
+                  </div>
 
-        <section class="section-card">
-          <div class="section-header">
-            <div>
-              <h2 class="section-title">Blocked sessions</h2>
-              <p class="section-copy">Issues paused because Codex requested operator input or approval.</p>
-            </div>
-          </div>
+                  <div class="backlog-meta">
+                    <span class="numeric"><%= format_priority(entry.priority) %></span>
+                    <span><%= entry.updated_at || entry.created_at || "n/a" %></span>
+                    <span><%= format_labels(entry.labels) %></span>
+                    <span><%= entry.assignee_id || "unassigned" %></span>
+                    <a class="issue-link" href={json_details_path(entry.issue_identifier)}>JSON details</a>
+                  </div>
+                </article>
+              </div>
+            <% end %>
+          </section>
 
-          <%= if @payload.blocked == [] do %>
-            <p class="empty-state">No blocked sessions.</p>
-          <% else %>
-            <div class="table-wrap">
-              <table class="data-table" style="min-width: 760px;">
-                <thead>
-                  <tr>
-                    <th>Issue</th>
-                    <th>State</th>
-                    <th>Session</th>
-                    <th>Blocked at</th>
-                    <th>Last update</th>
-                    <th>Error</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr :for={entry <- @payload.blocked}>
-                    <td>
-                      <div class="issue-stack">
-                        <.issue_identifier identifier={entry.issue_identifier} url={entry.issue_url} />
-                        <a class="issue-link" href={json_details_path(entry.issue_identifier)}>JSON details</a>
-                      </div>
-                    </td>
-                    <td>
-                      <span class={state_badge_class(entry.state || "Blocked")}>
-                        <%= entry.state || "Blocked" %>
-                      </span>
-                    </td>
-                    <td>
-                      <%= if entry.session_id do %>
-                        <button
-                          type="button"
-                          class="subtle-button"
-                          data-label="Copy ID"
-                          data-copy={entry.session_id}
-                          onclick="navigator.clipboard.writeText(this.dataset.copy); this.textContent = 'Copied'; clearTimeout(this._copyTimer); this._copyTimer = setTimeout(() => { this.textContent = this.dataset.label }, 1200);"
-                        >
-                          Copy ID
-                        </button>
-                      <% else %>
-                        <span class="muted">n/a</span>
-                      <% end %>
-                    </td>
-                    <td class="mono"><%= entry.blocked_at || "n/a" %></td>
-                    <td>
-                      <div class="detail-stack">
-                        <span
-                          class="event-text"
-                          title={entry.last_message || to_string(entry.last_event || "n/a")}
-                        ><%= entry.last_message || to_string(entry.last_event || "n/a") %></span>
-                        <span class="muted event-meta">
-                          <%= entry.last_event || "n/a" %>
-                          <%= if entry.last_event_at do %>
-                            · <span class="mono numeric"><%= entry.last_event_at %></span>
-                          <% end %>
+          <section class="section-card">
+            <div class="section-header">
+              <div>
+                <h2 class="section-title">Retry queue</h2>
+                <p class="section-copy">Issues waiting for the next retry window.</p>
+              </div>
+            </div>
+
+            <%= if @payload.retrying == [] do %>
+              <p class="empty-state">No issues are currently backing off.</p>
+            <% else %>
+              <div class="table-wrap">
+                <table class="data-table data-table-compact">
+                  <thead>
+                    <tr>
+                      <th>Issue</th>
+                      <th>Attempt</th>
+                      <th>Due at</th>
+                      <th>Error</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr :for={entry <- @payload.retrying}>
+                      <td>
+                        <div class="issue-stack">
+                          <.issue_identifier identifier={entry.issue_identifier} url={entry.issue_url} />
+                          <a class="issue-link" href={json_details_path(entry.issue_identifier)}>JSON details</a>
+                        </div>
+                      </td>
+                      <td><%= entry.attempt %></td>
+                      <td class="mono"><%= entry.due_at || "n/a" %></td>
+                      <td><%= entry.error || "n/a" %></td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            <% end %>
+          </section>
+        </div>
+
+        <div class="dashboard-section-grid">
+          <section class="section-card">
+            <div class="section-header">
+              <div>
+                <h2 class="section-title">Waiting sessions</h2>
+                <p class="section-copy">Issues in manual review or other configured waiting states.</p>
+              </div>
+            </div>
+
+            <%= if @payload.waiting == [] do %>
+              <p class="empty-state">No issues are waiting for manual review.</p>
+            <% else %>
+              <div class="table-wrap">
+                <table class="data-table data-table-compact">
+                  <thead>
+                    <tr>
+                      <th>Issue</th>
+                      <th>State</th>
+                      <th>Updated at</th>
+                      <th>Workspace</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr :for={entry <- @payload.waiting}>
+                      <td>
+                        <div class="issue-stack">
+                          <.issue_identifier identifier={entry.issue_identifier} url={entry.issue_url} />
+                          <a class="issue-link" href={json_details_path(entry.issue_identifier)}>JSON details</a>
+                        </div>
+                      </td>
+                      <td>
+                        <span class={state_badge_class(entry.state || "Waiting")}>
+                          <%= entry.state || "Waiting" %>
                         </span>
-                      </div>
-                    </td>
-                    <td><%= entry.error || "n/a" %></td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-          <% end %>
-        </section>
+                      </td>
+                      <td class="mono"><%= entry.updated_at || "n/a" %></td>
+                      <td class="mono"><%= entry.workspace_path || "n/a" %></td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            <% end %>
+          </section>
 
-        <section class="section-card">
-          <div class="section-header">
-            <div>
-              <h2 class="section-title">Retry queue</h2>
-              <p class="section-copy">Issues waiting for the next retry window.</p>
+          <section class="section-card">
+            <div class="section-header">
+              <div>
+                <h2 class="section-title">Blocked sessions</h2>
+                <p class="section-copy">Issues paused because Codex requested operator input or approval.</p>
+              </div>
             </div>
-          </div>
 
-          <%= if @payload.retrying == [] do %>
-            <p class="empty-state">No issues are currently backing off.</p>
-          <% else %>
-            <div class="table-wrap">
-              <table class="data-table" style="min-width: 680px;">
-                <thead>
-                  <tr>
-                    <th>Issue</th>
-                    <th>Attempt</th>
-                    <th>Due at</th>
-                    <th>Error</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr :for={entry <- @payload.retrying}>
-                    <td>
-                      <div class="issue-stack">
-                        <.issue_identifier identifier={entry.issue_identifier} url={entry.issue_url} />
-                        <a class="issue-link" href={json_details_path(entry.issue_identifier)}>JSON details</a>
-                      </div>
-                    </td>
-                    <td><%= entry.attempt %></td>
-                    <td class="mono"><%= entry.due_at || "n/a" %></td>
-                    <td><%= entry.error || "n/a" %></td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-          <% end %>
-        </section>
+            <%= if @payload.blocked == [] do %>
+              <p class="empty-state">No blocked sessions.</p>
+            <% else %>
+              <div class="table-wrap">
+                <table class="data-table data-table-compact">
+                  <thead>
+                    <tr>
+                      <th>Issue</th>
+                      <th>State</th>
+                      <th>Session</th>
+                      <th>Blocked at</th>
+                      <th>Last update</th>
+                      <th>Error</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr :for={entry <- @payload.blocked}>
+                      <td>
+                        <div class="issue-stack">
+                          <.issue_identifier identifier={entry.issue_identifier} url={entry.issue_url} />
+                          <a class="issue-link" href={json_details_path(entry.issue_identifier)}>JSON details</a>
+                        </div>
+                      </td>
+                      <td>
+                        <span class={state_badge_class(entry.state || "Blocked")}>
+                          <%= entry.state || "Blocked" %>
+                        </span>
+                      </td>
+                      <td>
+                        <%= if entry.session_id do %>
+                          <button
+                            type="button"
+                            class="subtle-button"
+                            data-label="Copy ID"
+                            data-copy={entry.session_id}
+                            onclick="navigator.clipboard.writeText(this.dataset.copy); this.textContent = 'Copied'; clearTimeout(this._copyTimer); this._copyTimer = setTimeout(() => { this.textContent = this.dataset.label }, 1200);"
+                          >
+                            Copy ID
+                          </button>
+                        <% else %>
+                          <span class="muted">n/a</span>
+                        <% end %>
+                      </td>
+                      <td class="mono"><%= entry.blocked_at || "n/a" %></td>
+                      <td>
+                        <div class="detail-stack">
+                          <span
+                            class="event-text"
+                            title={entry.last_message || to_string(entry.last_event || "n/a")}
+                          ><%= entry.last_message || to_string(entry.last_event || "n/a") %></span>
+                          <span class="muted event-meta">
+                            <%= entry.last_event || "n/a" %>
+                            <%= if entry.last_event_at do %>
+                              · <span class="mono numeric"><%= entry.last_event_at %></span>
+                            <% end %>
+                          </span>
+                        </div>
+                      </td>
+                      <td><%= entry.error || "n/a" %></td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            <% end %>
+          </section>
+        </div>
       <% end %>
     </section>
     """
@@ -527,6 +579,44 @@ defmodule SymphonyElixirWeb.DashboardLive do
   end
 
   defp recent_events_for_display(_events), do: []
+
+  defp backlog_display_limit, do: @backlog_display_limit
+
+  defp backlog_for_display(backlog) when is_list(backlog) do
+    Enum.take(backlog, @backlog_display_limit)
+  end
+
+  defp backlog_for_display(_backlog), do: []
+
+  defp backlog_overflow_count(backlog) when is_list(backlog) do
+    max(length(backlog) - @backlog_display_limit, 0)
+  end
+
+  defp backlog_overflow_count(_backlog), do: 0
+
+  defp format_priority(priority) when is_integer(priority) and priority in 1..4, do: "P#{priority}"
+  defp format_priority(_priority), do: "No priority"
+
+  defp format_labels(labels) when is_list(labels) do
+    label_names = Enum.filter(labels, &is_binary/1)
+
+    case label_names do
+      [] ->
+        "none"
+
+      _ ->
+        visible_labels = Enum.take(label_names, 3) |> Enum.join(", ")
+        extra_count = length(label_names) - 3
+
+        if extra_count > 0 do
+          "#{visible_labels} +#{extra_count}"
+        else
+          visible_labels
+        end
+    end
+  end
+
+  defp format_labels(_labels), do: "none"
 
   defp execution_step_class(status), do: "execution-step execution-step-#{status}"
   defp step_status_label("done"), do: "Done"
