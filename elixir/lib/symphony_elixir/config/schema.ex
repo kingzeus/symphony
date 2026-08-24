@@ -151,6 +151,7 @@ defmodule SymphonyElixir.Config.Schema do
 
     @primary_key false
     embedded_schema do
+      field(:backend, :string, default: "codex")
       field(:max_concurrent_agents, :integer, default: 10)
       field(:max_turns, :integer, default: 20)
       field(:max_retry_backoff_ms, :integer, default: 300_000)
@@ -162,14 +163,72 @@ defmodule SymphonyElixir.Config.Schema do
       schema
       |> cast(
         attrs,
-        [:max_concurrent_agents, :max_turns, :max_retry_backoff_ms, :max_concurrent_agents_by_state],
+        [:backend, :max_concurrent_agents, :max_turns, :max_retry_backoff_ms, :max_concurrent_agents_by_state],
         empty_values: []
       )
+      |> validate_inclusion(:backend, ["codex", "claude_code"])
       |> validate_number(:max_concurrent_agents, greater_than: 0)
       |> validate_number(:max_turns, greater_than: 0)
       |> validate_number(:max_retry_backoff_ms, greater_than: 0)
       |> update_change(:max_concurrent_agents_by_state, &Schema.normalize_state_limits/1)
       |> Schema.validate_state_limits(:max_concurrent_agents_by_state)
+    end
+  end
+
+  defmodule ClaudeCode do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @primary_key false
+    embedded_schema do
+      field(:command, :string, default: "claude")
+      field(:model, :string)
+      field(:permission_mode, :string, default: "default")
+      field(:allowed_tools, {:array, :string}, default: [])
+      field(:disallowed_tools, {:array, :string}, default: [])
+      field(:mcp_config, StringOrMap)
+      field(:include_partial_messages, :boolean, default: true)
+      field(:turn_timeout_ms, :integer, default: 3_600_000)
+      field(:stall_timeout_ms, :integer, default: 300_000)
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(
+        attrs,
+        [
+          :command,
+          :model,
+          :permission_mode,
+          :allowed_tools,
+          :disallowed_tools,
+          :mcp_config,
+          :include_partial_messages,
+          :turn_timeout_ms,
+          :stall_timeout_ms
+        ],
+        empty_values: []
+      )
+      |> validate_required([:command, :permission_mode])
+      |> validate_change(:command, fn :command, command ->
+        if command != "" and String.trim(command) == "" do
+          [command: "can't be blank"]
+        else
+          []
+        end
+      end)
+      |> validate_inclusion(:permission_mode, [
+        "default",
+        "auto",
+        "acceptEdits",
+        "plan",
+        "dontAsk",
+        "bypassPermissions"
+      ])
+      |> validate_number(:turn_timeout_ms, greater_than: 0)
+      |> validate_number(:stall_timeout_ms, greater_than_or_equal_to: 0)
     end
   end
 
@@ -298,6 +357,7 @@ defmodule SymphonyElixir.Config.Schema do
     embeds_one(:worker, Worker, on_replace: :update, defaults_to_struct: true)
     embeds_one(:agent, Agent, on_replace: :update, defaults_to_struct: true)
     embeds_one(:codex, Codex, on_replace: :update, defaults_to_struct: true)
+    embeds_one(:claude_code, ClaudeCode, on_replace: :update, defaults_to_struct: true)
     embeds_one(:hooks, Hooks, on_replace: :update, defaults_to_struct: true)
     embeds_one(:observability, Observability, on_replace: :update, defaults_to_struct: true)
     embeds_one(:server, Server, on_replace: :update, defaults_to_struct: true)
@@ -392,6 +452,7 @@ defmodule SymphonyElixir.Config.Schema do
     |> cast_embed(:worker, with: &Worker.changeset/2)
     |> cast_embed(:agent, with: &Agent.changeset/2)
     |> cast_embed(:codex, with: &Codex.changeset/2)
+    |> cast_embed(:claude_code, with: &ClaudeCode.changeset/2)
     |> cast_embed(:hooks, with: &Hooks.changeset/2)
     |> cast_embed(:observability, with: &Observability.changeset/2)
     |> cast_embed(:server, with: &Server.changeset/2)
@@ -462,7 +523,12 @@ defmodule SymphonyElixir.Config.Schema do
         turn_sandbox_policy: normalize_optional_map(settings.codex.turn_sandbox_policy)
     }
 
-    %{settings | tracker: tracker, workspace: workspace, codex: codex}
+    claude_code = %{
+      settings.claude_code
+      | mcp_config: normalize_optional_map(settings.claude_code.mcp_config)
+    }
+
+    %{settings | tracker: tracker, workspace: workspace, codex: codex, claude_code: claude_code}
   end
 
   defp normalize_keys(value) when is_map(value) do
@@ -476,6 +542,7 @@ defmodule SymphonyElixir.Config.Schema do
 
   defp normalize_optional_map(nil), do: nil
   defp normalize_optional_map(value) when is_map(value), do: normalize_keys(value)
+  defp normalize_optional_map(value) when is_binary(value), do: value
 
   defp normalize_key(value) when is_atom(value), do: Atom.to_string(value)
   defp normalize_key(value), do: to_string(value)

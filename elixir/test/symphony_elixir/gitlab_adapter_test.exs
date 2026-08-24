@@ -430,13 +430,16 @@ defmodule SymphonyElixir.GitLab.AdapterTest do
 
     assert binding.adapter == GitLabAdapter
 
-    assert binding.secret_environment_names == [
-             "GITLAB_PAT",
-             "GITLAB_ACCESS_TOKEN",
-             "GITLAB_TOKEN",
-             "OAUTH_TOKEN",
-             token_env
-           ]
+    expected_names =
+      MapSet.new([
+        "GITLAB_PAT",
+        "GITLAB_ACCESS_TOKEN",
+        "GITLAB_TOKEN",
+        "OAUTH_TOKEN",
+        token_env
+      ])
+
+    assert MapSet.subset?(expected_names, MapSet.new(binding.secret_environment_names))
 
     assert [%{"name" => "gitlab_api"}] = binding.tool_specs
     assert :ok = Config.validate!()

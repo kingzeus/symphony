@@ -105,6 +105,7 @@ defmodule SymphonyElixir.TestSupport do
           worker_ssh_hosts: [],
           worker_max_concurrent_agents_per_host: nil,
           max_concurrent_agents: 10,
+          agent_backend: "codex",
           max_turns: 20,
           max_retry_backoff_ms: 300_000,
           max_concurrent_agents_by_state: %{},
@@ -115,6 +116,15 @@ defmodule SymphonyElixir.TestSupport do
           codex_turn_timeout_ms: 3_600_000,
           codex_read_timeout_ms: 5_000,
           codex_stall_timeout_ms: 300_000,
+          claude_code_command: "claude",
+          claude_code_model: nil,
+          claude_code_permission_mode: "default",
+          claude_code_allowed_tools: [],
+          claude_code_disallowed_tools: [],
+          claude_code_mcp_config: nil,
+          claude_code_include_partial_messages: true,
+          claude_code_turn_timeout_ms: 3_600_000,
+          claude_code_stall_timeout_ms: 300_000,
           hook_after_create: nil,
           hook_before_run: nil,
           hook_after_run: nil,
@@ -144,6 +154,7 @@ defmodule SymphonyElixir.TestSupport do
     worker_ssh_hosts = Keyword.get(config, :worker_ssh_hosts)
     worker_max_concurrent_agents_per_host = Keyword.get(config, :worker_max_concurrent_agents_per_host)
     max_concurrent_agents = Keyword.get(config, :max_concurrent_agents)
+    agent_backend = Keyword.get(config, :agent_backend)
     max_turns = Keyword.get(config, :max_turns)
     max_retry_backoff_ms = Keyword.get(config, :max_retry_backoff_ms)
     max_concurrent_agents_by_state = Keyword.get(config, :max_concurrent_agents_by_state)
@@ -154,6 +165,15 @@ defmodule SymphonyElixir.TestSupport do
     codex_turn_timeout_ms = Keyword.get(config, :codex_turn_timeout_ms)
     codex_read_timeout_ms = Keyword.get(config, :codex_read_timeout_ms)
     codex_stall_timeout_ms = Keyword.get(config, :codex_stall_timeout_ms)
+    claude_code_command = Keyword.get(config, :claude_code_command)
+    claude_code_model = Keyword.get(config, :claude_code_model)
+    claude_code_permission_mode = Keyword.get(config, :claude_code_permission_mode)
+    claude_code_allowed_tools = Keyword.get(config, :claude_code_allowed_tools)
+    claude_code_disallowed_tools = Keyword.get(config, :claude_code_disallowed_tools)
+    claude_code_mcp_config = Keyword.get(config, :claude_code_mcp_config)
+    claude_code_include_partial_messages = Keyword.get(config, :claude_code_include_partial_messages)
+    claude_code_turn_timeout_ms = Keyword.get(config, :claude_code_turn_timeout_ms)
+    claude_code_stall_timeout_ms = Keyword.get(config, :claude_code_stall_timeout_ms)
     hook_after_create = Keyword.get(config, :hook_after_create)
     hook_before_run = Keyword.get(config, :hook_before_run)
     hook_after_run = Keyword.get(config, :hook_after_run)
@@ -185,6 +205,7 @@ defmodule SymphonyElixir.TestSupport do
         "  root: #{yaml_value(workspace_root)}",
         worker_yaml(worker_ssh_hosts, worker_max_concurrent_agents_per_host),
         "agent:",
+        "  backend: #{yaml_value(agent_backend)}",
         "  max_concurrent_agents: #{yaml_value(max_concurrent_agents)}",
         "  max_turns: #{yaml_value(max_turns)}",
         "  max_retry_backoff_ms: #{yaml_value(max_retry_backoff_ms)}",
@@ -197,6 +218,16 @@ defmodule SymphonyElixir.TestSupport do
         "  turn_timeout_ms: #{yaml_value(codex_turn_timeout_ms)}",
         "  read_timeout_ms: #{yaml_value(codex_read_timeout_ms)}",
         "  stall_timeout_ms: #{yaml_value(codex_stall_timeout_ms)}",
+        "claude_code:",
+        "  command: #{yaml_value(claude_code_command)}",
+        "  model: #{yaml_value(claude_code_model)}",
+        "  permission_mode: #{yaml_value(claude_code_permission_mode)}",
+        "  allowed_tools: #{yaml_value(claude_code_allowed_tools)}",
+        "  disallowed_tools: #{yaml_value(claude_code_disallowed_tools)}",
+        "  mcp_config: #{yaml_value(claude_code_mcp_config)}",
+        "  include_partial_messages: #{yaml_value(claude_code_include_partial_messages)}",
+        "  turn_timeout_ms: #{yaml_value(claude_code_turn_timeout_ms)}",
+        "  stall_timeout_ms: #{yaml_value(claude_code_stall_timeout_ms)}",
         hooks_yaml(hook_after_create, hook_before_run, hook_after_run, hook_before_remove, hook_timeout_ms),
         observability_yaml(observability_enabled, observability_refresh_ms, observability_render_interval_ms),
         server_yaml(server_port, server_host),

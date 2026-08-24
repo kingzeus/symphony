@@ -1612,7 +1612,7 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
-  test "agent runner forwards timestamped codex updates to recipient" do
+  test "agent runner forwards timestamped backend updates to recipient" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -1686,8 +1686,10 @@ defmodule SymphonyElixir.CoreTest do
                  issue_state_fetcher: fn [_issue_id] -> {:ok, [%{issue | state: "Done"}]} end
                )
 
-      assert_receive {:codex_worker_update, "issue-live-updates",
-                      %{
+      assert_receive {:agent_worker_update, "issue-live-updates",
+                      %SymphonyElixir.AgentServer.Event{
+                        backend: :codex,
+                        type: :session_started,
                         event: :session_started,
                         timestamp: %DateTime{},
                         session_id: session_id
@@ -1695,6 +1697,7 @@ defmodule SymphonyElixir.CoreTest do
                      500
 
       assert session_id == "thread-live-turn-live"
+      refute_received {:codex_worker_update, "issue-live-updates", _update}
     after
       File.rm_rf(test_root)
     end

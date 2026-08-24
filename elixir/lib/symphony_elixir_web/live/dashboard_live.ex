@@ -134,16 +134,16 @@ defmodule SymphonyElixirWeb.DashboardLive do
         <section class="runtime-metric-grid" aria-label="Runtime metrics">
           <article class="metric-card">
             <p class="metric-label">Total tokens</p>
-            <p class="metric-value numeric"><%= format_int(@payload.codex_totals.total_tokens) %></p>
+            <p class="metric-value numeric"><%= format_int(@payload.agent_totals.total_tokens) %></p>
             <p class="metric-detail numeric">
-              In <%= format_int(@payload.codex_totals.input_tokens) %> / Out <%= format_int(@payload.codex_totals.output_tokens) %>
+              In <%= format_int(@payload.agent_totals.input_tokens) %> / Out <%= format_int(@payload.agent_totals.output_tokens) %>
             </p>
           </article>
 
           <article class="metric-card">
             <p class="metric-label">Runtime</p>
             <p class="metric-value numeric"><%= format_runtime_seconds(total_runtime_seconds(@payload, @now)) %></p>
-            <p class="metric-detail">Total Codex runtime across completed and active sessions.</p>
+            <p class="metric-detail">Total agent runtime across completed and active sessions.</p>
           </article>
 
           <article class="metric-card rate-limit-card">
@@ -180,7 +180,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                     <th>State</th>
                     <th>Session</th>
                     <th>Runtime / turns</th>
-                    <th>Codex update</th>
+                    <th>Agent update</th>
                     <th>Tokens</th>
                   </tr>
                 </thead>
@@ -311,9 +311,9 @@ defmodule SymphonyElixirWeb.DashboardLive do
                   </div>
 
                   <div>
-                    <h4 class="detail-subtitle">Recent Codex events</h4>
+                    <h4 class="detail-subtitle">Recent agent events</h4>
                     <%= if selected_entry.recent_events == [] do %>
-                      <p class="empty-state empty-state-compact">No timestamped Codex events captured yet.</p>
+                      <p class="empty-state empty-state-compact">No timestamped agent events captured yet.</p>
                     <% else %>
                       <div class="event-list">
                         <div :for={event <- recent_events_for_display(selected_entry.recent_events)} class="event-row">
@@ -463,7 +463,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
             <div class="section-header">
               <div>
                 <h2 class="section-title">Blocked sessions</h2>
-                <p class="section-copy">Issues paused because Codex requested operator input or approval.</p>
+                <p class="section-copy">Issues paused because the selected agent requested operator input or approval.</p>
               </div>
             </div>
 
@@ -673,7 +673,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
   defp external_issue_url(_url), do: nil
 
   defp completed_runtime_seconds(payload) do
-    payload.codex_totals.seconds_running || 0
+    payload.agent_totals.seconds_running || 0
   end
 
   defp total_runtime_seconds(payload, now) do

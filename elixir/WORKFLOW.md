@@ -30,6 +30,7 @@ hooks:
   before_remove: |
     cd elixir && mise exec -- mix workspace.before_remove
 agent:
+  backend: codex
   max_concurrent_agents: 10
   max_turns: 20
 codex:
@@ -39,6 +40,12 @@ codex:
   turn_sandbox_policy:
     type: workspaceWrite
     networkAccess: true
+claude_code:
+  command: claude
+  # bypassPermissions removes Claude's approval boundary. Use it only in a disposable,
+  # strongly isolated worker with trusted code and least-privilege credentials.
+  permission_mode: default
+  include_partial_messages: true
 ---
 
 You are working on a Linear ticket `{{ issue.identifier }}`

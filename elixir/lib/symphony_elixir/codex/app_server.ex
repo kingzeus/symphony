@@ -3,7 +3,11 @@ defmodule SymphonyElixir.Codex.AppServer do
   Minimal client for the Codex app-server JSON-RPC 2.0 stream over stdio.
   """
 
+  @behaviour SymphonyElixir.AgentServer
+
   require Logger
+  alias SymphonyElixir.AgentServer
+  alias SymphonyElixir.AgentServer.WorkspaceGuard
   alias SymphonyElixir.{Codex.DynamicTool, Config, PathSafety, SSH}
 
   @initialize_id 1
@@ -20,55 +24,61 @@ defmodule SymphonyElixir.Codex.AppServer do
           turn_sandbox_policy: map(),
           thread_id: String.t(),
           workspace: Path.t(),
+          workspace_root: Path.t(),
           worker_host: String.t() | nil,
           dynamic_tool_binding: map()
         }
 
-  @spec run(Path.t(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
+  @spec run(Path.t(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, AgentServer.Error.t()}
   def run(workspace, prompt, issue, opts \\ []) do
     with {:ok, session} <- start_session(workspace, opts) do
       try do
-        run_turn(session, prompt, issue, opts)
+        run_turn(session, prompt, issue, legacy_callback_opts(opts))
       after
         stop_session(session)
       end
     end
   end
 
-  @spec start_session(Path.t(), keyword()) :: {:ok, session()} | {:error, term()}
+  @impl true
   def start_session(workspace, opts \\ []) do
     worker_host = Keyword.get(opts, :worker_host)
     dynamic_tool_binding = DynamicTool.bind()
 
-    with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
-         {:ok, port} <- start_port(expanded_workspace, worker_host, dynamic_tool_binding) do
-      metadata = port_metadata(port, worker_host)
+    result =
+      with {:ok, %{workspace: expanded_workspace, workspace_root: workspace_root}} <-
+             validate_workspace_context(workspace, worker_host),
+           {:ok, port} <- start_port(expanded_workspace, worker_host, dynamic_tool_binding) do
+        metadata = port_metadata(port, worker_host)
 
-      with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
-           {:ok, thread_id} <-
-             do_start_session(port, expanded_workspace, session_policies, dynamic_tool_binding) do
-        {:ok,
-         %{
-           port: port,
-           metadata: metadata,
-           approval_policy: session_policies.approval_policy,
-           auto_approve_requests: session_policies.approval_policy == "never",
-           thread_sandbox: session_policies.thread_sandbox,
-           turn_sandbox_policy: session_policies.turn_sandbox_policy,
-           thread_id: thread_id,
-           workspace: expanded_workspace,
-           worker_host: worker_host,
-           dynamic_tool_binding: dynamic_tool_binding
-         }}
-      else
-        {:error, reason} ->
-          stop_port(port)
-          {:error, reason}
+        with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
+             {:ok, thread_id} <-
+               do_start_session(port, expanded_workspace, session_policies, dynamic_tool_binding) do
+          {:ok,
+           %{
+             port: port,
+             metadata: metadata,
+             approval_policy: session_policies.approval_policy,
+             auto_approve_requests: session_policies.approval_policy == "never",
+             thread_sandbox: session_policies.thread_sandbox,
+             turn_sandbox_policy: session_policies.turn_sandbox_policy,
+             thread_id: thread_id,
+             workspace: expanded_workspace,
+             workspace_root: workspace_root,
+             worker_host: worker_host,
+             dynamic_tool_binding: dynamic_tool_binding
+           }}
+        else
+          {:error, reason} ->
+            stop_port(port)
+            {:error, reason}
+        end
       end
-    end
+
+    normalize_backend_result(result, :startup)
   end
 
-  @spec run_turn(session(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
+  @impl true
   def run_turn(
         %{
           port: port,
@@ -78,6 +88,8 @@ defmodule SymphonyElixir.Codex.AppServer do
           turn_sandbox_policy: turn_sandbox_policy,
           thread_id: thread_id,
           workspace: workspace,
+          workspace_root: workspace_root,
+          worker_host: worker_host,
           dynamic_tool_binding: dynamic_tool_binding
         },
         prompt,
@@ -91,6 +103,46 @@ defmodule SymphonyElixir.Codex.AppServer do
         DynamicTool.execute(tool, arguments, dynamic_tool_binding, issue: issue)
       end)
 
+    result =
+      case validate_turn_workspace(workspace, worker_host, workspace_root) do
+        {:ok, safe_workspace} ->
+          run_validated_turn(%{
+            port: port,
+            metadata: metadata,
+            approval_policy: approval_policy,
+            auto_approve_requests: auto_approve_requests,
+            turn_sandbox_policy: turn_sandbox_policy,
+            thread_id: thread_id,
+            workspace: safe_workspace,
+            prompt: prompt,
+            issue: issue,
+            on_message: on_message,
+            tool_executor: tool_executor
+          })
+
+        {:error, reason} ->
+          error = AgentServer.normalize_error(reason, :startup)
+          Logger.error("Codex session workspace validation failed for #{issue_context(issue)} kind=#{error.kind} code=#{inspect(error.code)}")
+          emit_message(on_message, :startup_failed, %{reason: reason, error: error}, metadata)
+          {:error, error}
+      end
+
+    normalize_backend_result(result, :provider)
+  end
+
+  defp run_validated_turn(%{
+         port: port,
+         metadata: metadata,
+         approval_policy: approval_policy,
+         auto_approve_requests: auto_approve_requests,
+         turn_sandbox_policy: turn_sandbox_policy,
+         thread_id: thread_id,
+         workspace: workspace,
+         prompt: prompt,
+         issue: issue,
+         on_message: on_message,
+         tool_executor: tool_executor
+       }) do
     case start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
       {:ok, turn_id} ->
         session_id = "#{thread_id}-#{turn_id}"
@@ -107,85 +159,77 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata
         )
 
-        case await_turn_completion(port, on_message, tool_executor, auto_approve_requests) do
-          {:ok, result} ->
-            Logger.info("Codex session completed for #{issue_context(issue)} session_id=#{session_id}")
-
-            {:ok,
-             %{
-               result: result,
-               session_id: session_id,
-               thread_id: thread_id,
-               turn_id: turn_id
-             }}
-
-          {:error, reason} ->
-            Logger.warning("Codex session ended with error for #{issue_context(issue)} session_id=#{session_id}: #{inspect(reason)}")
-
-            emit_message(
-              on_message,
-              :turn_ended_with_error,
-              %{
-                session_id: session_id,
-                reason: reason
-              },
-              metadata
-            )
-
-            {:error, reason}
-        end
+        port
+        |> await_turn_completion(on_message, tool_executor, auto_approve_requests)
+        |> finish_turn(issue, session_id, thread_id, turn_id, on_message, metadata)
 
       {:error, reason} ->
-        Logger.error("Codex session failed for #{issue_context(issue)}: #{inspect(reason)}")
-        emit_message(on_message, :startup_failed, %{reason: reason}, metadata)
-        {:error, reason}
+        error = AgentServer.normalize_error(reason, :startup)
+        Logger.error("Codex session failed for #{issue_context(issue)}: kind=#{error.kind} code=#{inspect(error.code)}")
+        emit_message(on_message, :startup_failed, %{reason: reason, error: error}, metadata)
+        {:error, error}
     end
   end
 
-  @spec stop_session(session()) :: :ok
+  defp finish_turn({:ok, result}, issue, session_id, thread_id, turn_id, _on_message, _metadata) do
+    Logger.info("Codex session completed for #{issue_context(issue)} session_id=#{session_id}")
+
+    {:ok,
+     %{
+       result: result,
+       session_id: session_id,
+       thread_id: thread_id,
+       turn_id: turn_id
+     }}
+  end
+
+  defp finish_turn({:error, reason}, issue, session_id, _thread_id, _turn_id, on_message, metadata) do
+    error = AgentServer.normalize_error(reason)
+    event = if error.kind == :cancelled, do: :turn_cancelled, else: :turn_ended_with_error
+
+    Logger.warning("Codex session ended with error for #{issue_context(issue)} session_id=#{session_id}: kind=#{error.kind} code=#{inspect(error.code)}")
+
+    emit_message(
+      on_message,
+      event,
+      %{
+        session_id: session_id,
+        reason: reason,
+        error: error
+      },
+      metadata
+    )
+
+    {:error, error}
+  end
+
+  @impl true
   def stop_session(%{port: port}) when is_port(port) do
     stop_port(port)
   end
 
-  defp validate_workspace_cwd(workspace, nil) when is_binary(workspace) do
-    expanded_workspace = Path.expand(workspace)
-    expanded_root = Config.local_workspace_root()
-    expanded_root_prefix = expanded_root <> "/"
+  defp validate_workspace_context(workspace, nil) when is_binary(workspace) do
+    workspace_root = Config.local_workspace_root()
 
-    with {:ok, canonical_workspace} <- PathSafety.canonicalize(expanded_workspace),
-         {:ok, canonical_root} <- PathSafety.canonicalize(expanded_root) do
-      canonical_root_prefix = canonical_root <> "/"
-
-      cond do
-        canonical_workspace == canonical_root ->
-          {:error, {:invalid_workspace_cwd, :workspace_root, canonical_workspace}}
-
-        String.starts_with?(canonical_workspace <> "/", canonical_root_prefix) ->
-          {:ok, canonical_workspace}
-
-        String.starts_with?(expanded_workspace <> "/", expanded_root_prefix) ->
-          {:error, {:invalid_workspace_cwd, :symlink_escape, expanded_workspace, canonical_root}}
-
-        true ->
-          {:error, {:invalid_workspace_cwd, :outside_workspace_root, canonical_workspace, canonical_root}}
-      end
-    else
-      {:error, {:path_canonicalize_failed, path, reason}} ->
-        {:error, {:invalid_workspace_cwd, :path_unreadable, path, reason}}
+    with {:ok, canonical_workspace} <- WorkspaceGuard.validate(workspace, nil, workspace_root),
+         {:ok, canonical_root} <- PathSafety.canonicalize(workspace_root) do
+      {:ok, %{workspace: canonical_workspace, workspace_root: canonical_root}}
     end
   end
 
-  defp validate_workspace_cwd(workspace, worker_host)
+  defp validate_workspace_context(workspace, worker_host)
        when is_binary(workspace) and is_binary(worker_host) do
-    cond do
-      String.trim(workspace) == "" ->
-        {:error, {:invalid_workspace_cwd, :empty_remote_workspace, worker_host}}
+    WorkspaceGuard.validate_remote(workspace, worker_host, Config.settings!().workspace.root)
+  end
 
-      String.contains?(workspace, ["\n", "\r", <<0>>]) ->
-        {:error, {:invalid_workspace_cwd, :invalid_remote_workspace, worker_host, workspace}}
+  defp validate_turn_workspace(workspace, nil, workspace_root) do
+    WorkspaceGuard.validate(workspace, nil, workspace_root)
+  end
 
-      true ->
-        {:ok, workspace}
+  defp validate_turn_workspace(workspace, worker_host, workspace_root) when is_binary(worker_host) do
+    case WorkspaceGuard.validate_remote(workspace, worker_host, workspace_root) do
+      {:ok, %{workspace: canonical_workspace}} -> {:ok, canonical_workspace}
+      {:error, _reason} = error -> error
     end
   end
 
@@ -378,6 +422,9 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests) do
     receive do
+      {:agent_cancel, reason} ->
+        {:error, cancellation_error(reason)}
+
       {^port, {:data, {:eol, chunk}}} ->
         complete_line = pending_line <> to_string(chunk)
         handle_incoming(port, on_message, complete_line, timeout_ms, tool_executor, auto_approve_requests)
@@ -898,6 +945,9 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp with_timeout_response(port, request_id, timeout_ms, pending_line) do
     receive do
+      {:agent_cancel, reason} ->
+        {:error, cancellation_error(reason)}
+
       {^port, {:data, {:eol, chunk}}} ->
         complete_line = pending_line <> to_string(chunk)
         handle_response(port, request_id, complete_line, timeout_ms)
@@ -952,6 +1002,21 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
+  defp cancellation_error(reason) do
+    AgentServer.Error.new(:cancelled, "Codex operation was cancelled",
+      code: reason,
+      retryable?: false,
+      raw: reason
+    )
+  end
+
+  defp normalize_backend_result({:ok, _value} = result, _context), do: result
+  defp normalize_backend_result({:error, %AgentServer.Error{}} = result, _context), do: result
+
+  defp normalize_backend_result({:error, reason}, context) do
+    {:error, AgentServer.normalize_error(reason, context)}
+  end
+
   defp protocol_message_candidate?(data) do
     data
     |> to_string()
@@ -970,6 +1035,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
       _ ->
         try do
+          terminate_port_process(port)
           Port.close(port)
           :ok
         rescue
@@ -979,10 +1045,51 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
+  defp terminate_port_process(port) do
+    with {:os_pid, os_pid} when is_integer(os_pid) <- :erlang.port_info(port, :os_pid),
+         executable when is_binary(executable) <- System.find_executable("kill") do
+      _ = System.cmd(executable, ["-TERM", Integer.to_string(os_pid)], stderr_to_stdout: true)
+      :ok
+    else
+      _ -> :ok
+    end
+  end
+
   defp emit_message(on_message, event, details, metadata) when is_function(on_message, 1) do
     message = metadata |> Map.merge(details) |> Map.put(:event, event) |> Map.put(:timestamp, DateTime.utc_now())
-    on_message.(message)
+    on_message.(AgentServer.normalize_event(:codex, message))
   end
+
+  defp legacy_callback_opts(opts) do
+    case Keyword.fetch(opts, :on_message) do
+      {:ok, on_message} when is_function(on_message, 1) ->
+        Keyword.put(opts, :on_message, fn event -> on_message.(legacy_callback_message(event)) end)
+
+      _ ->
+        opts
+    end
+  end
+
+  defp legacy_callback_message(message), do: plain_value(message)
+
+  defp plain_value(%DateTime{} = value), do: DateTime.to_iso8601(value)
+
+  defp plain_value(%_{} = value) do
+    value
+    |> Map.from_struct()
+    |> plain_value()
+  end
+
+  defp plain_value(value) when is_map(value) do
+    Map.new(value, fn {key, nested_value} -> {plain_map_key(key), plain_value(nested_value)} end)
+  end
+
+  defp plain_value(value) when is_list(value), do: Enum.map(value, &plain_value/1)
+  defp plain_value(value) when is_tuple(value), do: value |> Tuple.to_list() |> plain_value()
+  defp plain_value(value), do: value
+
+  defp plain_map_key(key) when is_binary(key) or is_atom(key) or is_integer(key), do: key
+  defp plain_map_key(key), do: inspect(key)
 
   defp metadata_from_message(port, payload) do
     port |> port_metadata(nil) |> maybe_set_usage(payload)

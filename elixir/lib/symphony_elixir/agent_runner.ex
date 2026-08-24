@@ -1,11 +1,10 @@
 defmodule SymphonyElixir.AgentRunner do
   @moduledoc """
-  Executes a single tracker work item in its workspace with Codex.
+  Executes a single tracker work item in its workspace with the selected backend.
   """
 
   require Logger
-  alias SymphonyElixir.Codex.AppServer
-  alias SymphonyElixir.{Config, PromptBuilder, Tracker, Workspace}
+  alias SymphonyElixir.{AgentServer, Config, PromptBuilder, Tracker, Workspace}
   alias SymphonyElixir.Tracker.Issue
 
   @type worker_host :: String.t() | nil
@@ -19,32 +18,52 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   @spec run(map(), pid() | nil, keyword()) :: :ok | no_return()
-  def run(issue, codex_update_recipient \\ nil, opts \\ []) do
+  def run(issue, agent_update_recipient \\ nil, opts \\ []) do
     # The orchestrator owns host retries so one worker lifetime never hops machines.
     worker_host = selected_worker_host(Keyword.get(opts, :worker_host), Config.settings!().worker.ssh_hosts)
 
     Logger.info("Starting agent run for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
 
-    case run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
+    case safely_run_on_worker_host(issue, agent_update_recipient, opts, worker_host) do
       :ok ->
         :ok
 
       {:error, reason} ->
-        Logger.error("Agent run failed for #{issue_context(issue)}: #{inspect(reason)}")
-        raise RuntimeError, "Agent run failed for #{issue_context(issue)}: #{inspect(reason)}"
+        error = AgentServer.normalize_error(reason)
+        error_text = safe_error_text(error)
+        Logger.error("Agent run failed for #{issue_context(issue)}: #{error_text}")
+        raise RuntimeError, "Agent run failed for #{issue_context(issue)}: #{error_text}"
     end
   end
 
-  defp run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
+  defp safely_run_on_worker_host(issue, agent_update_recipient, opts, worker_host) do
+    run_on_worker_host(issue, agent_update_recipient, opts, worker_host)
+  rescue
+    _exception ->
+      {:error,
+       AgentServer.Error.new(:provider, "agent backend raised an exception",
+         code: :backend_exception,
+         retryable?: true
+       )}
+  catch
+    _kind, _reason ->
+      {:error,
+       AgentServer.Error.new(:provider, "agent backend terminated unexpectedly",
+         code: :backend_termination,
+         retryable?: true
+       )}
+  end
+
+  defp run_on_worker_host(issue, agent_update_recipient, opts, worker_host) do
     Logger.info("Starting worker attempt for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
 
     case Workspace.create_for_issue(issue, worker_host) do
       {:ok, workspace} ->
-        send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace)
+        send_worker_runtime_info(agent_update_recipient, issue, worker_host, workspace)
 
         try do
           with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
-            run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host)
+            run_agent_turns(workspace, issue, agent_update_recipient, opts, worker_host)
           end
         after
           Workspace.run_after_run_hook(workspace, issue, worker_host)
@@ -55,19 +74,21 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp codex_message_handler(recipient, issue) do
+  defp agent_message_handler(recipient, issue, backend, error_marker) do
     fn message ->
-      send_codex_update(recipient, issue, message)
+      event = AgentServer.normalize_event(backend, message)
+      if not is_nil(event.error), do: Process.put(error_marker, true)
+      send_agent_update(recipient, issue, event)
     end
   end
 
-  defp send_codex_update(recipient, %Issue{id: issue_id}, message)
+  defp send_agent_update(recipient, %Issue{id: issue_id}, message)
        when is_binary(issue_id) and is_pid(recipient) do
-    send(recipient, {:codex_worker_update, issue_id, message})
+    send(recipient, {:agent_worker_update, issue_id, message})
     :ok
   end
 
-  defp send_codex_update(_recipient, _issue, _message), do: :ok
+  defp send_agent_update(_recipient, _issue, _message), do: :ok
 
   defp send_worker_runtime_info(recipient, %Issue{id: issue_id}, worker_host, workspace)
        when is_binary(issue_id) and is_pid(recipient) and is_binary(workspace) do
@@ -85,59 +106,178 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp send_worker_runtime_info(_recipient, _issue, _worker_host, _workspace), do: :ok
 
-  defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
+  defp run_agent_turns(workspace, issue, agent_update_recipient, opts, worker_host) do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issues_by_ids/1)
+    backend_module = Keyword.get(opts, :backend_module, Config.agent_backend_module())
+    backend = AgentServer.backend_name(backend_module)
 
-    with {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host) do
-      try do
-        do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
-      after
-        AppServer.stop_session(session)
-      end
+    start_opts =
+      opts
+      |> Keyword.get(:backend_start_opts, [])
+      |> Keyword.put(:worker_host, worker_host)
+
+    case start_backend_session(backend_module, workspace, start_opts) do
+      {:ok, session} ->
+        final_session_marker = make_ref()
+
+        loop = %{
+          backend_module: backend_module,
+          backend: backend,
+          workspace: workspace,
+          agent_update_recipient: agent_update_recipient,
+          opts: opts,
+          issue_state_fetcher: issue_state_fetcher,
+          max_turns: max_turns,
+          final_session_marker: final_session_marker
+        }
+
+        Process.put(final_session_marker, session)
+
+        try do
+          result = do_run_agent_turns(loop, session, issue, 1)
+          Process.put(final_session_marker, final_session(result))
+          normalize_turn_result(result)
+        after
+          final_session = Process.get(final_session_marker, session)
+          Process.delete(final_session_marker)
+          stop_session_safely(backend_module, final_session)
+        end
+
+      {:error, reason} ->
+        error = AgentServer.normalize_error(reason, :startup)
+        send_agent_error(agent_update_recipient, issue, backend, :startup_failed, error)
+        {:error, error}
     end
   end
 
-  defp do_run_codex_turns(app_session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do
-    prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
+  defp start_backend_session(backend_module, workspace, start_opts) do
+    backend_module.start_session(workspace, start_opts)
+  rescue
+    _exception ->
+      {:error,
+       AgentServer.Error.new(:startup, "agent backend startup raised an exception",
+         code: :backend_startup_exception,
+         retryable?: true
+       )}
+  catch
+    _kind, _reason ->
+      {:error,
+       AgentServer.Error.new(:startup, "agent backend startup terminated unexpectedly",
+         code: :backend_startup_termination,
+         retryable?: true
+       )}
+  end
 
-    with {:ok, turn_session} <-
-           AppServer.run_turn(
-             app_session,
-             prompt,
-             issue,
-             on_message: codex_message_handler(codex_update_recipient, issue)
-           ) do
-      Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
+  defp do_run_agent_turns(loop, session, issue, turn_number) do
+    prompt = build_turn_prompt(issue, loop.opts, turn_number, loop.max_turns)
 
-      case continue_with_issue?(issue, issue_state_fetcher) do
-        {:continue, refreshed_issue} when turn_number < max_turns ->
-          Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
+    case run_backend_turn(loop, session, prompt, issue) do
+      {:ok, turn_session} ->
+        updated_session = Map.get(turn_session, :session, session)
+        Process.put(loop.final_session_marker, updated_session)
 
-          do_run_codex_turns(
-            app_session,
-            workspace,
-            refreshed_issue,
-            codex_update_recipient,
-            opts,
-            issue_state_fetcher,
-            turn_number + 1,
-            max_turns
+        Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{loop.workspace} turn=#{turn_number}/#{loop.max_turns}")
+
+        case continue_with_issue?(issue, loop.issue_state_fetcher) do
+          {:continue, refreshed_issue} when turn_number < loop.max_turns ->
+            Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{loop.max_turns}")
+
+            do_run_agent_turns(loop, updated_session, refreshed_issue, turn_number + 1)
+
+          {:continue, refreshed_issue} ->
+            Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
+
+            {:ok, updated_session}
+
+          {:done, _refreshed_issue} ->
+            {:ok, updated_session}
+
+          {:error, reason} ->
+            {:error, AgentServer.normalize_error(reason, :tracker), updated_session}
+        end
+
+      {:error, reason} ->
+        error = AgentServer.normalize_error(reason)
+        {:error, error, session}
+    end
+  end
+
+  defp run_backend_turn(loop, session, prompt, issue) do
+    error_marker = make_ref()
+    Process.put(error_marker, false)
+
+    try do
+      result =
+        try do
+          loop.backend_module.run_turn(
+            session,
+            prompt,
+            issue,
+            on_message: agent_message_handler(loop.agent_update_recipient, issue, loop.backend, error_marker)
           )
+        rescue
+          _exception ->
+            {:error,
+             AgentServer.Error.new(:provider, "agent backend turn raised an exception",
+               code: :backend_turn_exception,
+               retryable?: true
+             )}
+        catch
+          _kind, _reason ->
+            {:error,
+             AgentServer.Error.new(:provider, "agent backend turn terminated unexpectedly",
+               code: :backend_turn_termination,
+               retryable?: true
+             )}
+        end
 
-        {:continue, refreshed_issue} ->
-          Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
-
-          :ok
-
-        {:done, _refreshed_issue} ->
-          :ok
-
+      case result do
         {:error, reason} ->
-          {:error, reason}
+          error = AgentServer.normalize_error(reason)
+
+          unless Process.get(error_marker) do
+            send_agent_error(loop.agent_update_recipient, issue, loop.backend, :turn_failed, error)
+          end
+
+          {:error, error}
+
+        other ->
+          other
       end
+    after
+      Process.delete(error_marker)
     end
   end
+
+  defp stop_session_safely(backend_module, session) do
+    case backend_module.stop_session(session) do
+      :ok -> :ok
+      _other -> :ok
+    end
+  rescue
+    _exception -> :ok
+  catch
+    _kind, _reason -> :ok
+  end
+
+  defp final_session({:ok, session}), do: session
+  defp final_session({:error, _reason, session}), do: session
+
+  defp send_agent_error(recipient, issue, backend, type, error) do
+    send_agent_update(recipient, issue, AgentServer.Event.new(backend, type, error: error))
+  end
+
+  defp normalize_turn_result({:ok, _session}), do: :ok
+  defp normalize_turn_result({:error, reason, _session}), do: {:error, reason}
+
+  defp safe_error_text(%AgentServer.Error{} = error) do
+    "kind=#{error.kind} code=#{safe_error_code(error.code)}"
+  end
+
+  defp safe_error_code(code) when is_atom(code) or is_integer(code), do: to_string(code)
+  defp safe_error_code(code) when is_binary(code), do: String.slice(code, 0, 120)
+  defp safe_error_code(_code), do: "unknown"
 
   defp build_turn_prompt(issue, opts, 1, _max_turns), do: PromptBuilder.build_prompt(issue, opts)
 
@@ -145,7 +285,7 @@ defmodule SymphonyElixir.AgentRunner do
     """
     Continuation guidance:
 
-    - The previous Codex turn completed normally, but the tracker work item is still in an active state.
+    - The previous agent turn completed normally, but the tracker work item is still in an active state.
     - This is continuation turn ##{turn_number} of #{max_turns} for the current agent run.
     - Resume from the current workspace and workpad state instead of restarting from scratch.
     - The original task instructions and prior turn context are already present in this thread, so do not restate them before acting.
