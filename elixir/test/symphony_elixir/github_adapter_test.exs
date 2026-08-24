@@ -384,13 +384,16 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
 
     assert binding.adapter == GitHubAdapter
 
-    assert binding.secret_environment_names == [
-             "GITHUB_TOKEN",
-             "GH_TOKEN",
-             "GITHUB_ENTERPRISE_TOKEN",
-             "GH_ENTERPRISE_TOKEN",
-             token_env
-           ]
+    expected_names =
+      MapSet.new([
+        "GITHUB_TOKEN",
+        "GH_TOKEN",
+        "GITHUB_ENTERPRISE_TOKEN",
+        "GH_ENTERPRISE_TOKEN",
+        token_env
+      ])
+
+    assert MapSet.subset?(expected_names, MapSet.new(binding.secret_environment_names))
 
     assert [%{"name" => "github_api"}] = binding.tool_specs
     assert :ok = Config.validate!()

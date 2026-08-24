@@ -370,7 +370,12 @@ defmodule SymphonyElixir.Asana.AdapterTest do
     binding = Tracker.bind_agent_tools()
 
     assert binding.adapter == AsanaAdapter
-    assert binding.secret_environment_names == ["ASANA_PAT", token_env]
+
+    assert MapSet.subset?(
+             MapSet.new(["ASANA_PAT", token_env]),
+             MapSet.new(binding.secret_environment_names)
+           )
+
     assert [%{"name" => "asana_api"}] = binding.tool_specs
     assert :ok = Config.validate!()
   end

@@ -248,21 +248,27 @@ State tracked while a coding-agent subprocess is running.
 
 Fields:
 
-- `session_id` (string, `<thread_id>-<turn_id>`)
-- `thread_id` (string)
-- `turn_id` (string)
-- `codex_app_server_pid` (string or null)
-- `last_codex_event` (string/enum or null)
-- `last_codex_timestamp` (timestamp or null)
-- `last_codex_message` (summarized payload)
-- `codex_input_tokens` (integer)
-- `codex_output_tokens` (integer)
-- `codex_total_tokens` (integer)
-- `last_reported_input_tokens` (integer)
-- `last_reported_output_tokens` (integer)
-- `last_reported_total_tokens` (integer)
+- `backend` (`codex | claude_code`)
+- `session_id` (provider session identity)
+- `thread_id` (string or null)
+- `turn_id` (string or null)
+- `agent_process_id` (string or null)
+- `last_agent_event` (string/enum or null)
+- `last_agent_timestamp` (timestamp or null)
+- `last_agent_message` (summarized payload)
+- `last_agent_error` (typed error or null)
+- `last_agent_approval` (typed approval or null)
+- `agent_updates` / `raw_agent_updates` (bounded event histories)
+- `agent_input_tokens` / `agent_output_tokens` / `agent_total_tokens` (integers)
+- `agent_cache_read_input_tokens` / `agent_cache_creation_input_tokens` (integers)
+- `agent_last_reported_*` (absolute-usage high-water marks)
+- `agent_usage_identities` (deduplication identities)
 - `turn_count` (integer)
   - Number of coding-agent turns started within the current worker lifetime.
+
+During the compatibility window, implementations MAY also expose mirrored `codex_*` aliases such
+as `codex_app_server_pid`, `last_codex_event`, and `codex_total_tokens`. Those aliases MUST NOT
+become the owner of provider-neutral orchestration policy.
 
 #### 4.1.7 Retry Entry
 
@@ -291,8 +297,9 @@ Fields:
 - `claimed` (set of issue IDs reserved/running/retrying)
 - `retry_attempts` (map `issue_id -> RetryEntry`)
 - `completed` (set of issue IDs; bookkeeping only, not dispatch gating)
-- `codex_totals` (aggregate tokens + runtime seconds)
-- `codex_rate_limits` (latest rate-limit snapshot from agent events)
+- `agent_totals` (aggregate tokens, cache tokens, and runtime seconds)
+- `agent_rate_limits` (latest rate-limit snapshot from agent events)
+- `codex_totals` / `codex_rate_limits` (compatibility aliases during migration)
 
 ### 4.2 Stable Identifiers and Normalization Rules
 
@@ -315,7 +322,10 @@ Fields:
 - `Normalized Issue State`
   - Compare states after trimming surrounding whitespace and applying `lowercase`.
 - `Session ID`
-  - Compose from coding-agent `thread_id` and `turn_id` as `<thread_id>-<turn_id>`.
+  - Treat as the selected provider's opaque resumable session identity.
+  - For Codex, expose the compatibility value `<thread_id>-<turn_id>` for the active turn.
+  - For Claude Code, use the successful provider `result.session_id`; keep `turn_id` as a separate
+    Symphony turn identity and do not synthesize it into the provider session ID.
 
 ## 5. Workflow Specification (Repository Contract)
 
@@ -364,6 +374,7 @@ Top-level keys:
 - `hooks`
 - `agent`
 - `codex`
+- `claude_code`
 
 Unknown keys SHOULD be ignored for forward compatibility.
 
@@ -451,6 +462,10 @@ Fields:
 
 Fields:
 
+- `backend` (string)
+  - Default: `codex`
+  - Supported values: `codex`, `claude_code`.
+  - Selects one backend for future worker sessions. Invalid values fail configuration validation.
 - `max_concurrent_agents` (integer)
   - Default: `10`
   - Changes SHOULD be re-applied at runtime and affect subsequent dispatch decisions.
@@ -495,6 +510,44 @@ fields locally if they want stricter startup checks.
 - `stall_timeout_ms` (integer)
   - Default: `300000` (5 minutes)
   - If `<= 0`, stall detection is disabled.
+
+#### 5.3.7 `claude_code` (object)
+
+The Claude Code backend is an independent `AgentServer` implementation. It does not implement or
+emulate the Codex JSON-RPC app-server protocol.
+
+Fields:
+
+- `command` (string shell command)
+  - Default: `claude`
+  - MAY include a shell prefix such as `env NAME=value claude`.
+- `model` (string or null)
+  - Default: omitted, allowing Claude Code to choose its configured/default model.
+- `permission_mode` (string)
+  - Default: `default`
+  - Supported values: `default`, `auto`, `acceptEdits`, `plan`, `dontAsk`, `bypassPermissions`.
+  - `auto` delegates approval behavior to Claude Code's non-interactive policy.
+  - `bypassPermissions` removes Claude Code's normal approval boundary. It MUST NOT be selected by
+    default and SHOULD be used only for trusted code inside a disposable, strongly isolated worker
+    with least-privilege credentials. Repository instructions, hooks, prompts, and tools must be
+    treated as potentially destructive when this mode is enabled.
+- `allowed_tools` (list of strings)
+  - Default: `[]`.
+  - Passed as repeated `--allowedTools` options.
+- `disallowed_tools` (list of strings)
+  - Default: `[]`.
+  - Passed as repeated `--disallowedTools` options.
+- `mcp_config` (string or object or null)
+  - Passed to Claude Code's `--mcp-config`; objects are JSON encoded.
+  - This MUST NOT be described as a Codex DynamicTool compatibility bridge.
+- `include_partial_messages` (boolean)
+  - Default: `true`.
+- `turn_timeout_ms` (positive integer)
+  - Default: `3600000` (1 hour).
+  - Maximum silence interval for the Claude `stream-json` output, not a total runtime cap.
+- `stall_timeout_ms` (non-negative integer)
+  - Default: `300000` (5 minutes).
+  - Used by orchestrator stall detection when `agent.backend == claude_code`; `0` disables it.
 
 ### 5.4 Prompt Template Contract
 
@@ -570,8 +623,8 @@ Dynamic reload is REQUIRED:
 - The software MUST detect `WORKFLOW.md` changes.
 - On change, it MUST re-read and re-apply workflow config and prompt template without restart.
 - The software MUST attempt to adjust live behavior to the new config (for example polling
-  cadence, concurrency limits, active/terminal states, codex settings, workspace paths/hooks, and
-  prompt content for future runs).
+  cadence, concurrency limits, active/terminal states, selected backend settings, workspace
+  paths/hooks, and prompt content for future runs).
 - Reloaded config applies to future dispatch, retry scheduling, reconciliation decisions, hook
   execution, and agent launches.
 - Implementations are not REQUIRED to restart in-flight agent sessions automatically when config
@@ -606,7 +659,9 @@ Validation checks:
 - `tracker.kind` is present and supported.
 - The selected adapter accepts `tracker.provider` after documented defaults and `$VAR`
   resolution.
-- `codex.command` is present and non-empty.
+- `agent.backend` is one of the implementation-supported backends.
+- Backend command fields are valid and non-empty when configured; built-in defaults provide
+  `codex app-server` and `claude` when omitted.
 
 ### 6.4 Core Config Fields Summary (Cheat Sheet)
 
@@ -627,6 +682,7 @@ not require recognizing or validating extension fields unless that extension is 
 - `hooks.after_run`: shell script or null
 - `hooks.before_remove`: shell script or null
 - `hooks.timeout_ms`: integer, default `60000`
+- `agent.backend`: `codex | claude_code`, default `codex`
 - `agent.max_concurrent_agents`: integer, default `10`
 - `agent.max_turns`: integer, default `20`
 - `agent.max_retry_backoff_ms`: integer, default `300000` (5m)
@@ -638,6 +694,15 @@ not require recognizing or validating extension fields unless that extension is 
 - `codex.turn_timeout_ms`: integer, default `3600000`
 - `codex.read_timeout_ms`: integer, default `5000`
 - `codex.stall_timeout_ms`: integer, default `300000`
+- `claude_code.command`: shell command string, default `claude`
+- `claude_code.model`: string or null, default null
+- `claude_code.permission_mode`: string, default `default`
+- `claude_code.allowed_tools`: list of strings, default `[]`
+- `claude_code.disallowed_tools`: list of strings, default `[]`
+- `claude_code.mcp_config`: string, object, or null
+- `claude_code.include_partial_messages`: boolean, default `true`
+- `claude_code.turn_timeout_ms`: integer, default `3600000`
+- `claude_code.stall_timeout_ms`: integer, default `300000`
 
 ## 7. Orchestration State Machine
 
@@ -717,8 +782,10 @@ Distinct terminal reasons are important because retry logic and logs differ.
   - Update aggregate runtime totals.
   - Schedule exponential-backoff retry.
 
-- `Codex Update Event`
-  - Update live session fields, token counters, and rate limits.
+- `Agent Update Event`
+  - Update provider-neutral live session fields, token counters, approvals, errors, and rate limits.
+  - New workers emit `agent_worker_update`; an implementation MAY accept the legacy
+    `codex_worker_update` mailbox tag during migration, but MUST NOT make a worker emit both.
 
 - `Retry Timer Fired`
   - Re-fetch active candidates and attempt re-dispatch, or release claim if no longer eligible.
@@ -830,9 +897,10 @@ Reconciliation runs every tick and has two parts.
 Part A: Stall detection
 
 - For each running issue, compute `elapsed_ms` since:
-  - `last_codex_timestamp` if any event has been seen, else
+  - `last_agent_timestamp` if any event has been seen, else
   - `started_at`
-- If `elapsed_ms > codex.stall_timeout_ms`, terminate the worker and queue a retry.
+- If `elapsed_ms` exceeds the selected backend's `stall_timeout_ms`, terminate the worker and queue
+  a retry.
 - If `stall_timeout_ms <= 0`, skip stall detection entirely.
 
 Part B: Tracker state refresh
@@ -956,40 +1024,47 @@ Invariant 3: Workspace key is sanitized.
 
 ## 10. Agent Runner Protocol (Coding Agent Integration)
 
-This section defines Symphony's language-neutral responsibilities when integrating a Codex
-app-server. The Codex app-server protocol for the targeted Codex version is the source of truth for
-protocol schemas, message payloads, transport framing, and method names.
+This section defines Symphony's provider-neutral `AgentServer` boundary and the backend-specific
+contracts behind it. `SymphonyElixir.Codex.AppServer` remains the Codex JSON-RPC 2.0 stdio client;
+`SymphonyElixir.ClaudeCodeBackend` is a separate Claude Code CLI `stream-json` implementation.
+Claude support MUST NOT be implemented by adding Claude branches inside the Codex app-server
+client or by claiming that Claude Code speaks the Codex protocol.
 
-Protocol source of truth:
+Backend protocol sources of truth:
 
-- Implementations MUST send messages that are valid for the targeted Codex app-server version.
-- Implementations MUST consult the targeted Codex app-server documentation or generated schema
-  instead of treating this specification as a protocol schema.
-- If this specification appears to conflict with the targeted Codex app-server protocol, the Codex
-  protocol controls protocol shape and transport behavior.
+- Codex implementations MUST send messages valid for the targeted Codex app-server version and
+  consult its documentation or generated schema.
+- Claude implementations MUST use flags and `stream-json` records supported by the targeted Claude
+  Code CLI version.
+- If this specification conflicts with a provider protocol, that provider controls its protocol
+  shape, flags, framing, and payloads.
 - Symphony-specific requirements in this section still control orchestration behavior, workspace
-  selection, prompt construction, continuation handling, and observability extraction.
+  selection, prompt construction, continuation handling, typed event normalization, and
+  observability extraction.
 
 ### 10.1 Launch Contract
 
 Subprocess launch parameters:
 
-- Command: `codex.command`
-- Invocation: `bash -lc <codex.command>`
+- Backend: `agent.backend`
+- Command: `codex.command` or `claude_code.command`
+- Invocation: backend-owned shell command launched under `bash -lc`
 - Working directory: workspace path
-- Transport/framing: the protocol transport required by the targeted Codex app-server version
+- Transport/framing: the selected backend's protocol
 
 Notes:
 
-- The default command is `codex app-server`.
-- Approval policy, sandbox policy, cwd, prompt input, and OPTIONAL tool declarations are supplied
-  using fields supported by the targeted Codex app-server version.
+- The default backend is Codex and its default command is `codex app-server`.
+- The Claude Code command defaults to `claude`; Symphony appends non-interactive `stream-json`
+  flags and configured model, permission, tool, MCP, and session arguments.
+- Approval, sandbox/permission, cwd, prompt input, and OPTIONAL tool declarations are supplied only
+  through fields supported by the selected backend.
 
 RECOMMENDED additional process settings:
 
 - Max line size: 10 MB (for safe buffering)
 
-### 10.2 Session Startup Responsibilities
+### 10.2 Codex App-Server Session Startup Responsibilities
 
 Reference: https://developers.openai.com/codex/app-server/
 
@@ -1017,7 +1092,7 @@ Session identifiers:
 - Emit `session_id = "<thread_id>-<turn_id>"`
 - Reuse the same `thread_id` for all continuation turns inside one worker run
 
-### 10.3 Streaming Turn Processing
+### 10.3 Codex Streaming Turn Processing
 
 The client processes app-server updates according to the targeted Codex app-server protocol until
 the active turn terminates.
@@ -1043,16 +1118,35 @@ Transport handling requirements:
 - For stdio-based transports, keep protocol stream handling separate from diagnostic stderr
   handling unless the targeted protocol specifies otherwise.
 
-### 10.4 Emitted Runtime Events (Upstream to Orchestrator)
+### 10.4 Unified Runtime Events (Backend to Orchestrator)
 
-The app-server client emits structured events to the orchestrator callback. Each event SHOULD
-include:
+Every backend emits one normalized event type owned by `AgentServer`. Each event SHOULD include:
 
+- `backend` (`codex | claude_code`)
+- `type` (provider-neutral enum/string)
 - `event` (enum/string)
 - `timestamp` (UTC timestamp)
-- `codex_app_server_pid` (if available)
-- OPTIONAL `usage` map (token counts)
+- `session_id`, `thread_id`, and `turn_id` where available
+- `process_id` (if available)
+- OPTIONAL typed `usage`, `error`, and `approval` values
 - payload fields as needed
+
+Usage MUST declare `mode` (`absolute | delta`), `scope` (`thread | turn`), and a stable `identity`
+for deduplication. Errors MUST declare retryable and blocked semantics directly; the orchestrator
+MUST NOT need to infer Claude behavior from Codex method strings. Provider raw payloads SHOULD be
+retained for diagnostics. Compatibility aliases such as `event` and `codex_app_server_pid` MAY be
+retained while existing consumers migrate.
+
+Legacy map updates MAY use atom or string keys for the normalized event fields. Normalization MUST
+resolve the provider-neutral `type` before constructing typed errors or approvals, while retaining
+the original compatibility `event` value for diagnostics and older consumers. Orchestrator turn
+identity MUST use the normalized type so a string-valued `session_started` event still advances the
+turn count exactly once per distinct turn identity.
+
+Backend lifecycle callbacks MUST return the typed `AgentServer.Error` contract at the shared
+boundary. Provider-specific tuples MAY remain in `raw`, but MUST NOT escape to `AgentRunner` as the
+callback error value. Cooperative cancellation MUST also return a typed cancelled error so backend
+cleanup runs before any orchestrator force-stop fallback.
 
 Important emitted events include, for example:
 
@@ -1063,7 +1157,11 @@ Important emitted events include, for example:
 - `turn_cancelled`
 - `turn_ended_with_error`
 - `turn_input_required`
+- `approval_required`
 - `approval_auto_approved`
+- `approval_resolved`
+- `progress`
+- `tool_activity`
 - `unsupported_tool_call`
 - `notification`
 - `other_message`
@@ -1080,6 +1178,9 @@ Policy requirements:
 - Approval requests and user-input-required events MUST NOT leave a run stalled indefinitely. An
   implementation MAY either satisfy them, surface them to an operator, auto-resolve them, or
   fail the run according to its documented policy.
+- A backend permission denial that needs operator action SHOULD emit a typed approval plus an error
+  with `blocked? = true` and `retryable? = false`.
+- Transient provider failures SHOULD emit typed errors with `retryable? = true`.
 
 Example high-trust behavior:
 
@@ -1098,6 +1199,9 @@ Unsupported dynamic tool calls:
 Optional provider-native agent tool extension:
 
 - An adapter MAY expose provider-native tools to the app-server session.
+- The current host-side DynamicTool bridge is a Codex app-server capability. A Claude Code backend
+  MAY pass an explicit MCP configuration to Claude, but MUST NOT silently represent Codex
+  DynamicTools as Claude tools.
 - The selected adapter's tool specs SHOULD be advertised during session startup using the protocol
   mechanism supported by the targeted Codex app-server version.
 - Tool specs, adapter selection, and effective tracker settings MUST be bound to one session
@@ -1154,6 +1258,9 @@ Timeouts:
 - `codex.turn_timeout_ms`: maximum silence interval while a turn stream is active; each
   app-server output resets it, so it is not a total turn runtime cap
 - `codex.stall_timeout_ms`: enforced by orchestrator based on event inactivity
+- `claude_code.turn_timeout_ms`: maximum silence interval for valid Claude `stream-json` output;
+  valid partial/progress frames reset it
+- `claude_code.stall_timeout_ms`: enforced by orchestrator when Claude is selected
 
 Error mapping (RECOMMENDED normalized categories):
 
@@ -1166,22 +1273,80 @@ Error mapping (RECOMMENDED normalized categories):
 - `turn_failed`
 - `turn_cancelled`
 - `turn_input_required`
+- `approval_required`
+- `provider_error`
+- `protocol_error`
+- `process_exit`
 
 ### 10.7 Agent Runner Contract
 
-The `Agent Runner` wraps workspace + prompt + app-server client.
+The `Agent Runner` wraps workspace + prompt + the selected `AgentServer` backend.
 
 Behavior:
 
 1. Create/reuse workspace for issue.
 2. Build prompt from workflow template.
-3. Start app-server session.
-4. Forward app-server events to orchestrator.
+3. Start the selected backend session.
+4. Forward normalized `AgentServer.Event` values to the orchestrator via `agent_worker_update`.
 5. On any error, fail the worker attempt (the orchestrator will retry).
 
 Note:
 
 - Workspaces are intentionally preserved after successful runs.
+
+### 10.8 Claude Code Backend Contract
+
+Claude Code sessions use the CLI in non-interactive mode. The effective invocation MUST include:
+
+```text
+claude --print --input-format text --output-format stream-json --verbose
+```
+
+The configured `claude_code.command` replaces only the command prefix; Symphony appends supported
+flags for partial messages, model, permission mode, allowed/disallowed tools, MCP configuration,
+and session continuation.
+
+Prompt and process safety:
+
+- The prompt MUST be framed over stdin and MUST NOT appear in argv or logs.
+- Local and SSH workers MUST use equivalent prompt framing and workspace validation.
+- The child shell SHOULD create a mode-`0600` temporary prompt file and remove it on normal exit,
+  signals, and failures.
+- Declared tracker secret environment variables MUST be removed from the local or remote child
+  environment before Claude starts.
+- Local canonical paths MUST remain below the configured workspace root; root execution, outside
+  paths, and symlink escapes fail closed.
+- Local cleanup SHOULD terminate the complete provider process tree with `TERM`, then `KILL` after
+  the grace period. Descendant discovery prefers `pgrep -P`, falls back to parsing the portable
+  `ps` PID/PPID table when `pgrep` is unavailable, and remains best-effort on the direct Port PID if
+  neither discovery tool exists.
+- SSH launch-script cleanup MUST recursively signal the remote provider tree with the same
+  `pgrep -P` then `ps` PID/PPID discovery order, and fall back to the direct remote agent PID when
+  neither descendant-discovery tool exists.
+
+Session continuation:
+
+- The first turn uses a generated valid UUID with `--session-id`.
+- A successful provider `result` record's real `session_id` becomes authoritative.
+- Later turns use that provider session identity with `--resume`.
+- `stop_session` MUST be idempotent.
+
+Streaming and normalization:
+
+- Newline-delimited JSON frames and a final no-EOL frame MUST both be processed.
+- `stream_event` and partial message frames emit progress/heartbeat events and reset silence timeout.
+- Assistant text emits notification events; tool use/results emit tool-activity events.
+- A terminal `result` or `error` frame ends the turn immediately; Symphony MUST NOT wait for a
+  lingering provider process to exit or for the silence timeout before cleanup.
+- A successful `result` emits turn completion and turn-scoped delta usage.
+- Claude input/output, cache-read, and cache-creation token fields MUST remain available in the
+  normalized usage and provider raw payload.
+- An omitted provider `total_tokens` remains unknown and contributes zero to the aggregate total;
+  it MUST NOT be inferred from input plus output tokens.
+- Permission denials emit typed blocked approval/error semantics.
+- Provider errors, malformed protocol frames (including valid JSON values that are not objects),
+  non-zero process exit, missing result, and silence timeout emit typed errors with explicit
+  retryable/blocked semantics.
 
 ## 11. Issue Tracker Integration Contract
 
@@ -1405,11 +1570,15 @@ SHOULD return:
   not currently dispatched)
 - `retrying` (list of retry queue rows)
 - session and retry rows SHOULD include the tracker-provided issue URL when available
-- `codex_totals`
+- `agent_totals`
   - `input_tokens`
   - `output_tokens`
   - `total_tokens`
-  - `seconds_running` (aggregate runtime seconds as of snapshot time, including active sessions)
+  - `cache_read_input_tokens`
+  - `cache_creation_input_tokens`
+  - `seconds_running`
+- `codex_totals`
+  - Compatibility alias for the aggregate agent totals during migration.
 - `rate_limits` (latest coding-agent rate limit payload, if available)
 
 RECOMMENDED snapshot error modes:
@@ -1429,16 +1598,17 @@ correctness.
 
 Token accounting rules:
 
-- Agent events can include token counts in multiple payload shapes.
-- Prefer absolute thread totals when available, such as:
-  - `thread/tokenUsage/updated` payloads
-  - `total_token_usage` within token-count wrapper events
-- Ignore delta-style payloads such as `last_token_usage` for dashboard/API totals.
-- Extract input/output/total token counts leniently from common field names within the selected
-  payload.
-- For absolute totals, track deltas relative to last reported totals to avoid double-counting.
-- Do not treat generic `usage` maps as cumulative totals unless the event type defines them that
-  way.
+- Normalized usage MUST declare `mode`, `scope`, and `identity`.
+- For `absolute/thread` usage, track per-field high-water marks and add only positive increases.
+- Codex cumulative sources include `thread/tokenUsage/updated`, nested `total_token_usage`, and the
+  final `turn/completed.usage` value when it is produced from the app-server's cached
+  `total_token_usage`.
+  Delta-style Codex fields such as `last_token_usage` MUST NOT be added on top of those totals.
+- For `delta/turn` usage, add every unique identity. Claude Code result usage uses this mode, so a
+  later smaller turn still contributes its full delta.
+- Repeated identities MUST contribute zero.
+- Preserve provider raw usage plus input/output/total and cache-read/cache-creation fields.
+- Do not infer cumulative versus incremental semantics from a generic field name alone.
 - Accumulate aggregate totals in orchestrator state.
 
 Runtime accounting:
@@ -1838,8 +2008,15 @@ function start_service():
     claimed: set(),
     retry_attempts: {},
     completed: set(),
-    codex_totals: {input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
-    codex_rate_limits: null
+    agent_totals: {
+      input_tokens: 0,
+      output_tokens: 0,
+      total_tokens: 0,
+      cache_read_input_tokens: 0,
+      cache_creation_input_tokens: 0,
+      seconds_running: 0
+    },
+    agent_rate_limits: null
   }
 
   validation = validate_dispatch_config()
@@ -1934,14 +2111,17 @@ function dispatch_issue(issue, state, attempt):
     monitor_handle,
     identifier: issue.identifier,
     issue,
+    backend: selected_agent_backend(),
     session_id: null,
-    codex_app_server_pid: null,
-    last_codex_message: null,
-    last_codex_event: null,
-    last_codex_timestamp: null,
-    codex_input_tokens: 0,
-    codex_output_tokens: 0,
-    codex_total_tokens: 0,
+    agent_process_id: null,
+    last_agent_message: null,
+    last_agent_event: null,
+    last_agent_timestamp: null,
+    agent_input_tokens: 0,
+    agent_output_tokens: 0,
+    agent_total_tokens: 0,
+    agent_cache_read_input_tokens: 0,
+    agent_cache_creation_input_tokens: 0,
     last_reported_input_tokens: 0,
     last_reported_output_tokens: 0,
     last_reported_total_tokens: 0,
@@ -1965,7 +2145,8 @@ function run_agent_attempt(issue, attempt, orchestrator_channel):
   if run_hook("before_run", workspace.path) failed:
     fail_worker("before_run hook error")
 
-  session = app_server.start_session(workspace=workspace.path)
+  backend = agent_server.backend_module(config.agent.backend)
+  session = backend.start_session(workspace=workspace.path)
   if session failed:
     run_hook_best_effort("after_run", workspace.path)
     fail_worker("agent session startup error")
@@ -1976,25 +2157,27 @@ function run_agent_attempt(issue, attempt, orchestrator_channel):
   while true:
     prompt = build_turn_prompt(workflow_template, issue, attempt, turn_number, max_turns)
     if prompt failed:
-      app_server.stop_session(session)
+      backend.stop_session(session)
       run_hook_best_effort("after_run", workspace.path)
       fail_worker("prompt error")
 
-    turn_result = app_server.run_turn(
+    turn_result = backend.run_turn(
       session=session,
       prompt=prompt,
       issue=issue,
-      on_message=(msg) -> send(orchestrator_channel, {codex_update, issue.id, msg})
+      on_message=(event) -> send(orchestrator_channel, {agent_worker_update, issue.id, event})
     )
 
     if turn_result failed:
-      app_server.stop_session(session)
+      backend.stop_session(session)
       run_hook_best_effort("after_run", workspace.path)
       fail_worker("agent turn error")
 
+    session = turn_result.session
+
     refreshed_issue = tracker.fetch_issues_by_ids([issue.id])
     if refreshed_issue failed:
-      app_server.stop_session(session)
+      backend.stop_session(session)
       run_hook_best_effort("after_run", workspace.path)
       fail_worker("issue state refresh error")
 
@@ -2011,7 +2194,7 @@ function run_agent_attempt(issue, attempt, orchestrator_channel):
 
     turn_number = turn_number + 1
 
-  app_server.stop_session(session)
+  backend.stop_session(session)
   run_hook_best_effort("after_run", workspace.path)
 
   exit_normal()

@@ -1,13 +1,56 @@
-# Codex Token Accounting
+# Coding-Agent Token Accounting
 
-This document explains how Codex reports token usage through the app-server protocol and how Symphony should account for it.
+This document explains the shared Symphony token model and the backend-specific reports that feed
+it. Codex app-server reports cumulative thread snapshots; Claude Code `stream-json` results report
+per-turn deltas. Treating both as the same kind of number will either double-count Codex or
+under-count Claude continuation turns.
 
-It is based on the current Codex source in `codex-rs`, especially:
+## Unified Symphony Usage Contract
+
+Every normalized usage value declares:
+
+- `mode`: `absolute` or `delta`
+- `scope`: `thread` or `turn`
+- `identity`: a stable event identity used to suppress duplicates
+- input, output, and optional total tokens
+- optional cache-read and cache-creation input tokens
+- provider raw usage
+
+Accounting rules:
+
+- `absolute/thread` values use per-field high-water marks; only positive increases are added.
+- `delta/turn` values are added for every unique identity, even when a later turn is smaller than
+  an earlier turn.
+- A repeated identity contributes zero to all counters.
+- `total_tokens` is used only when the provider reports it. A missing total remains unknown and
+  contributes zero to the aggregate total; Symphony never derives it from input plus output.
+- Cache token fields follow the same absolute/delta mode and remain visible in agent-neutral
+  snapshot/API fields.
+- `codex_*` totals are compatibility aliases; `agent_*` fields own the provider-neutral model.
+
+## Codex App-Server Source Notes
+
+The remainder of the Codex analysis is based on the current source in `codex-rs`, especially:
 
 - `app-server/README.md`
 - `protocol/src/protocol.rs`
 - `app-server/src/bespoke_event_handling.rs`
 - `app-server-protocol/src/protocol/v2.rs`
+
+## Claude Code Result Usage
+
+Claude Code completion records carry a `usage` object for that result/turn. Symphony normalizes it
+as `delta/turn` with identity `{claude_result, provider_session_id, turn_id}` and preserves:
+
+- `input_tokens`
+- `output_tokens`
+- `total_tokens` when present
+- `cache_read_input_tokens`
+- `cache_creation_input_tokens`
+
+The provider `session_id` from the successful result is authoritative for future `--resume` turns.
+Usage from two different turns MUST both be accumulated even if the second turn reports fewer
+tokens. Replaying the same result identity MUST not add it again.
 - `exec/src/event_processor_with_jsonl_output.rs`
 - `state/src/extract.rs`
 
@@ -202,7 +245,7 @@ So `total_tokens` can reflect context-window normalization behavior, not just a 
 
 For Symphony, `model_context_window` should be displayed or logged separately from spend.
 
-## Recommended Accounting Strategy For Symphony
+## Recommended Codex Accounting Strategy
 
 Track usage per active Codex thread.
 
@@ -289,10 +332,13 @@ That is a strong signal for Symphony:
 
 If Symphony documents token reporting externally, the contract should be:
 
-- Live token totals come from Codex thread-scoped cumulative usage.
-- Incremental usage may also be emitted, but Symphony does not use it for totals.
-- Turn-completed usage is event-specific and should not be assumed to be a fresh additive increment.
-- Reporting is thread-based, and multiple turns can occur on one thread.
+- Codex live token totals come from thread-scoped cumulative usage and are integrated as
+  `absolute/thread` high-water marks.
+- Claude Code result usage is turn-scoped and integrated as unique `delta/turn` values.
+- Generic `usage` field names do not decide accounting mode; the backend event contract does.
+- Duplicate identities contribute zero.
+- Input, output, total, cache-read, and cache-creation counters are available through
+  provider-neutral `agent_*` fields, with transitional `codex_*` aliases where documented.
 
 ## Implementation Checklist
 
@@ -302,3 +348,5 @@ If Symphony documents token reporting externally, the contract should be:
 - Key totals by `thread_id`
 - Do not classify generic `usage` by field name alone
 - Do not double-count turn-completed usage after live updates
+- Add each unique Claude result usage as a turn delta
+- Preserve cache-read and cache-creation input tokens

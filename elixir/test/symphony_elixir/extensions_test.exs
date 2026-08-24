@@ -213,7 +213,23 @@ defmodule SymphonyElixir.ExtensionsTest do
     binding = SymphonyElixir.Tracker.bind_agent_tools()
     assert binding.adapter == Memory
     assert binding.tool_specs == []
-    assert binding.secret_environment_names == []
+
+    expected_secret_names =
+      MapSet.new(~w[
+        ASANA_PAT
+        GITHUB_TOKEN
+        GH_TOKEN
+        GITHUB_ENTERPRISE_TOKEN
+        GH_ENTERPRISE_TOKEN
+        GITLAB_PAT
+        GITLAB_ACCESS_TOKEN
+        GITLAB_TOKEN
+        OAUTH_TOKEN
+        JIRA_API_TOKEN
+        LINEAR_API_KEY
+      ])
+
+    assert MapSet.new(binding.secret_environment_names) == expected_secret_names
 
     assert SymphonyElixir.Tracker.execute_bound_agent_tool(binding, "not_a_memory_tool", %{})[
              "success"
@@ -224,7 +240,9 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "linear")
     assert SymphonyElixir.Tracker.adapter() == Adapter
-    assert SymphonyElixir.Tracker.bind_agent_tools().secret_environment_names == ["LINEAR_API_KEY"]
+
+    assert MapSet.new(SymphonyElixir.Tracker.bind_agent_tools().secret_environment_names) ==
+             expected_secret_names
   end
 
   test "linear adapter delegates reads and advertises its native agent tool" do
@@ -286,13 +304,23 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "state" => "In Progress",
                  "worker_host" => nil,
                  "workspace_path" => nil,
+                 "backend" => "codex",
                  "session_id" => "thread-http",
                  "turn_count" => 7,
                  "last_event" => "notification",
                  "last_message" => "rendered",
                  "started_at" => state_payload["running"] |> List.first() |> Map.fetch!("started_at"),
                  "last_event_at" => nil,
-                 "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12},
+                 "tokens" => %{
+                   "input_tokens" => 4,
+                   "output_tokens" => 8,
+                   "total_tokens" => 12,
+                   "cache_read_input_tokens" => 0,
+                   "cache_creation_input_tokens" => 0
+                 },
+                 "agent_process_id" => nil,
+                 "codex_app_server_pid" => nil,
+                 "codex_total_tokens" => 12,
                  "execution" => expected_execution,
                  "recent_events" => []
                }
@@ -319,6 +347,7 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "worker_host" => "dm-dev2",
                  "workspace_path" => "/workspaces/MT-BLOCKED",
                  "session_id" => "thread-blocked",
+                 "backend" => "codex",
                  "blocked_at" => state_payload["blocked"] |> List.first() |> Map.fetch!("blocked_at"),
                  "last_event" => "turn_input_required",
                  "last_message" => "turn blocked: waiting for user input",
@@ -336,6 +365,12 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "workspace_path" => nil
                }
              ],
+             "agent_totals" => %{
+               "input_tokens" => 4,
+               "output_tokens" => 8,
+               "total_tokens" => 12,
+               "seconds_running" => 42.5
+             },
              "codex_totals" => %{
                "input_tokens" => 4,
                "output_tokens" => 8,
@@ -361,20 +396,27 @@ defmodule SymphonyElixir.ExtensionsTest do
                "worker_host" => nil,
                "workspace_path" => nil,
                "session_id" => "thread-http",
+               "backend" => "codex",
                "turn_count" => 7,
                "state" => "In Progress",
                "started_at" => issue_payload["running"]["started_at"],
                "last_event" => "notification",
                "last_message" => "rendered",
                "last_event_at" => nil,
-               "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12},
+               "tokens" => %{
+                 "input_tokens" => 4,
+                 "output_tokens" => 8,
+                 "total_tokens" => 12,
+                 "cache_read_input_tokens" => 0,
+                 "cache_creation_input_tokens" => 0
+               },
                "execution" => expected_execution
              },
              "retry" => nil,
              "backlog" => nil,
              "blocked" => nil,
              "waiting" => nil,
-             "logs" => %{"codex_session_logs" => []},
+             "logs" => %{"agent_session_logs" => [], "codex_session_logs" => []},
              "recent_events" => [],
              "raw_events" => [],
              "last_error" => nil,
@@ -681,7 +723,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "Live"
     assert html =~ "Offline"
     assert html =~ "Copy ID"
-    assert html =~ "Codex update"
+    assert html =~ "Agent update"
     assert html =~ "Click a running session to inspect live execution details."
     refute html =~ "Agent details"
     refute html =~ "data-runtime-clock="
@@ -1029,7 +1071,7 @@ defmodule SymphonyElixir.ExtensionsTest do
           "detail" => "Workspace path was not reported."
         },
         %{
-          "label" => "Codex session started",
+          "label" => "Agent session started",
           "status" => "done",
           "detail" => "thread-http"
         },

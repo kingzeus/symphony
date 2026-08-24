@@ -16,21 +16,24 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 1. Polls the configured tracker for candidate work (included adapters: Linear, GitHub Issues, Jira
    Cloud, Asana, and GitLab)
 2. Creates a workspace per issue
-3. Launches Codex in [App Server mode](https://developers.openai.com/codex/app-server/) inside the
-   workspace
-4. Sends a workflow prompt to Codex
-5. Keeps Codex working on the issue until the work is done
+3. Launches the selected coding-agent backend inside the workspace: Codex in
+   [App Server mode](https://developers.openai.com/codex/app-server/) or Claude Code in
+   non-interactive `stream-json` mode
+4. Sends the workflow prompt to that backend
+5. Keeps the selected agent working on the issue until the work is done
 
-During app-server sessions, the selected tracker adapter may advertise provider-native tools. The
+During Codex app-server sessions, the selected tracker adapter may advertise provider-native tools.
 Linear serves `linear_graphql`, GitHub Issues serves `github_api`, Jira Cloud serves
 `jira_rest`, Asana serves `asana_api`, and GitLab serves `gitlab_api`. Symphony executes those
 tools with configured host-side auth and removes declared tracker-token environment variables from
-the Codex child, so the agent does not need a second tracker login.
+the Codex child, so the agent does not need a second tracker login. The Claude Code backend does not
+pretend these DynamicTools are Claude tools; use `claude_code.mcp_config` for an explicit Claude MCP
+configuration when needed.
 
 If a claimed issue moves to a terminal state (`Done`, `Closed`, `Cancelled`, or `Duplicate`),
 Symphony stops the active agent for that issue and cleans up matching workspaces.
 
-If Codex reports that operator input, approval, or MCP elicitation is required, Symphony keeps the
+If the selected backend reports that operator input or approval is required, Symphony keeps the
 issue claimed and exposes it as blocked in the runtime state, JSON API, and dashboard. Blocked
 entries are in memory only; restarting the orchestrator clears that blocked map, so any still-active
 tracker issue can become a dispatch candidate again after restart.
@@ -78,7 +81,8 @@ mise exec -- ./bin/symphony ./WORKFLOW.md
 
 Symphony ships self-contained executables built with
 [Burrito](https://github.com/burrito-elixir/burrito). They embed Erlang/OTP, Elixir, and Symphony,
-but still expect `codex`, `git`, and the selected tracker credentials on the target machine.
+but still expect `git`, the selected backend executable (`codex` or `claude`), and the selected
+tracker credentials on the target machine.
 
 Supported release targets:
 
@@ -113,7 +117,7 @@ Optional flags:
 - `--port` also starts the Phoenix observability service (default: disabled)
 
 The `WORKFLOW.md` file uses YAML front matter for configuration, plus a Markdown body used as the
-Codex session prompt.
+coding-agent session prompt.
 
 Minimal example:
 
@@ -129,10 +133,14 @@ hooks:
   after_create: |
     git clone git@github.com:your-org/your-repo.git .
 agent:
+  backend: codex
   max_concurrent_agents: 10
   max_turns: 20
 codex:
   command: codex app-server
+claude_code:
+  command: claude
+  permission_mode: default
 ---
 
 You are working on an issue from the configured tracker {{ issue.identifier }}.
@@ -143,6 +151,9 @@ Title: {{ issue.title }} Body: {{ issue.description }}
 Notes:
 
 - If a value is missing, defaults are used.
+- `agent.backend` selects `codex` (default) or `claude_code`. Invalid values fail configuration
+  validation. `SymphonyElixir.Codex.AppServer` remains a Codex-only JSON-RPC client; Claude Code is
+  implemented by the separate `SymphonyElixir.ClaudeCodeBackend`.
 - `tracker.kind` selects an adapter. Adapter-owned endpoint, scope, and auth settings belong under
   `tracker.provider`; the current Linear adapter still accepts the older flat `endpoint`,
   `api_key`, `project_slug`, and `assignee` aliases for compatibility.
@@ -155,6 +166,31 @@ Notes:
   - `codex.turn_sandbox_policy` defaults to a `workspaceWrite` policy rooted at the current issue workspace
 - `codex.turn_timeout_ms` is the maximum silence interval while a turn is streaming. Each
   app-server update resets it; it is not a total turn runtime cap.
+- `claude_code.command` defaults to `claude` and may include a shell prefix such as
+  `env CLAUDE_CONFIG_DIR=... claude`. Symphony adds `--print --input-format text --output-format
+  stream-json --verbose`, plus configured model/tool/MCP/session flags.
+- `claude_code.model` is optional. `permission_mode` defaults to `default`; supported values are
+  `default`, `auto`, `acceptEdits`, `plan`, `dontAsk`, and `bypassPermissions`. `auto` delegates the
+  approval posture to Claude Code's non-interactive policy. `bypassPermissions` disables Claude's
+  normal permission checks and can allow repository content, hooks, prompts, or tools to execute
+  destructive actions without an approval stop. Use it only for trusted code in a disposable,
+  strongly isolated worker with least-privilege credentials; Symphony never selects it by default.
+- `claude_code.allowed_tools` and `claude_code.disallowed_tools` are repeated CLI tool filters.
+  `claude_code.mcp_config` accepts either a string/path understood by Claude Code or a map encoded as
+  JSON. This is pass-through configuration, not a host-side Codex DynamicTool bridge.
+- `claude_code.include_partial_messages` defaults to `true`.
+- `claude_code.turn_timeout_ms` is the Claude stream silence timeout. Partial messages and other
+  valid `stream-json` frames reset it. `claude_code.stall_timeout_ms` is the corresponding
+  orchestrator inactivity limit; the selected backend's stall timeout is always used.
+- Claude prompts are framed over stdin into a child-owned mode-`0600` temporary file, are not placed
+  in argv or logs, and use the same launch contract on local and SSH workers. Declared tracker
+  secret environment variables are removed before Claude starts.
+- Local Claude cleanup sends `TERM` and then `KILL` to the discovered process tree. It uses
+  `pgrep -P` when available, falls back to a `ps` PID/PPID table, and still attempts the direct Port
+  PID when neither descendant-discovery tool exists. The SSH launch trap uses the same discovery
+  order to recursively send `TERM` to the remote provider tree.
+- The first Claude turn uses a generated UUID with `--session-id`; later turns use the provider's
+  returned `session_id` with `--resume`.
 - Supported `codex.approval_policy` values depend on the targeted Codex app-server version. In the current local Codex schema, string values include `untrusted`, `on-failure`, `on-request`, and `never`, and object-form `reject` is also supported.
 - Supported `codex.thread_sandbox` values: `read-only`, `workspace-write`, `danger-full-access`.
 - When `codex.turn_sandbox_policy` is set explicitly, Symphony passes the map through to Codex
@@ -163,7 +199,7 @@ Notes:
 - Workflows that run package managers or other commands that resolve external hosts should set
   `networkAccess: true` in `codex.turn_sandbox_policy`; otherwise DNS/network access may be denied
   by the Codex turn sandbox.
-- `agent.max_turns` caps how many back-to-back Codex turns Symphony will run in a single agent
+- `agent.max_turns` caps how many back-to-back coding-agent turns Symphony will run in a single agent
   invocation when a turn completes normally but the issue is still in an active state. Default: `20`.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
@@ -173,13 +209,13 @@ Notes:
   the project dependencies in `hooks.after_create` before invoking `mise` later from other hooks.
 - For the Linear adapter, `tracker.provider.api_key` reads from `LINEAR_API_KEY` when unset or
   when value is `$LINEAR_API_KEY`. The legacy flat `tracker.api_key` alias behaves the same way.
-- Do not put a literal tracker token in a repo-owned `WORKFLOW.md` if Codex can read that
+- Do not put a literal tracker token in a repo-owned `WORKFLOW.md` if the coding agent can read that
   workspace. Use `$VAR`/host-side secret references so Symphony can keep the token out of the
   child environment.
 - For path values, `~` is expanded to the home directory.
 - For env-backed path values, use `$VAR`. `workspace.root` resolves `$VAR` before path handling,
-  while `codex.command` stays a shell command string and any `$VAR` expansion there happens in the
-  launched shell.
+  while `codex.command` and `claude_code.command` stay shell command strings and any `$VAR`
+  expansion there happens in the launched shell.
 
 ```yaml
 tracker:
@@ -192,6 +228,8 @@ hooks:
     git clone --depth 1 "$SOURCE_REPO_URL" .
 codex:
   command: "$CODEX_BIN --config 'model=\"gpt-5.5\"' app-server"
+claude_code:
+  command: "env CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR $CLAUDE_BIN"
 ```
 
 - If `WORKFLOW.md` is missing or has invalid YAML at startup, Symphony does not boot.
@@ -293,7 +331,7 @@ The observability UI now runs on a minimal Phoenix stack:
 
 - LiveView for the dashboard at `/`
 - Clickable running-session rows with an agent detail panel for current stage,
-  completed/pending execution steps, workspace metadata, and recent Codex events
+  completed/pending execution steps, workspace metadata, backend identity, and recent agent events
 - JSON API for operational debugging under `/api/v1/*`
 - Bandit as the HTTP server
 - Phoenix dependency static assets for the LiveView client bootstrap

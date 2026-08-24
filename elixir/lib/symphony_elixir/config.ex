@@ -3,7 +3,7 @@ defmodule SymphonyElixir.Config do
   Runtime configuration loaded from `WORKFLOW.md`.
   """
 
-  alias SymphonyElixir.{Config.Schema, Tracker}
+  alias SymphonyElixir.{AgentServer, Config.Schema, Tracker}
   alias SymphonyElixir.{Workflow, WorkflowStore}
 
   @default_prompt_template """
@@ -24,6 +24,18 @@ defmodule SymphonyElixir.Config do
           approval_policy: String.t() | map(),
           thread_sandbox: String.t(),
           turn_sandbox_policy: map()
+        }
+
+  @type claude_code_runtime_settings :: %{
+          command: String.t(),
+          model: String.t() | nil,
+          permission_mode: String.t(),
+          allowed_tools: [String.t()],
+          disallowed_tools: [String.t()],
+          mcp_config: String.t() | map() | nil,
+          include_partial_messages: boolean(),
+          turn_timeout_ms: pos_integer(),
+          stall_timeout_ms: non_neg_integer()
         }
 
   @spec settings() :: {:ok, Schema.t()} | {:error, term()}
@@ -111,6 +123,47 @@ defmodule SymphonyElixir.Config do
          }}
       end
     end
+  end
+
+  @spec agent_backend() :: :codex | :claude_code
+  def agent_backend do
+    case settings!().agent.backend do
+      "claude_code" -> :claude_code
+      _ -> :codex
+    end
+  end
+
+  @spec agent_backend_module() :: module()
+  def agent_backend_module, do: AgentServer.backend_module(agent_backend())
+
+  @spec agent_stall_timeout_ms() :: non_neg_integer()
+  def agent_stall_timeout_ms, do: agent_stall_timeout_ms(agent_backend())
+
+  @spec agent_stall_timeout_ms(:codex | :claude_code) :: non_neg_integer()
+  def agent_stall_timeout_ms(backend) when backend in [:codex, :claude_code] do
+    settings = settings!()
+
+    case backend do
+      :claude_code -> settings.claude_code.stall_timeout_ms
+      :codex -> settings.codex.stall_timeout_ms
+    end
+  end
+
+  @spec claude_code_runtime_settings() :: claude_code_runtime_settings()
+  def claude_code_runtime_settings do
+    settings = settings!().claude_code
+
+    %{
+      command: settings.command,
+      model: settings.model,
+      permission_mode: settings.permission_mode,
+      allowed_tools: settings.allowed_tools,
+      disallowed_tools: settings.disallowed_tools,
+      mcp_config: settings.mcp_config,
+      include_partial_messages: settings.include_partial_messages,
+      turn_timeout_ms: settings.turn_timeout_ms,
+      stall_timeout_ms: settings.stall_timeout_ms
+    }
   end
 
   @doc false

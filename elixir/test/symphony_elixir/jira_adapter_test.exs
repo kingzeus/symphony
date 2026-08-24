@@ -521,7 +521,12 @@ defmodule SymphonyElixir.Jira.AdapterTest do
     binding = Tracker.bind_agent_tools()
 
     assert binding.adapter == JiraAdapter
-    assert binding.secret_environment_names == ["JIRA_API_TOKEN", token_env]
+
+    assert MapSet.subset?(
+             MapSet.new(["JIRA_API_TOKEN", token_env]),
+             MapSet.new(binding.secret_environment_names)
+           )
+
     assert [%{"name" => "jira_rest"}] = binding.tool_specs
     assert :ok = Config.validate!()
   end

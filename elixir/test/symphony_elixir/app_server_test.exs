@@ -29,10 +29,18 @@ defmodule SymphonyElixir.AppServerTest do
         labels: ["backend"]
       }
 
-      assert {:error, {:invalid_workspace_cwd, :workspace_root, _path}} =
+      assert {:error,
+              %SymphonyElixir.AgentServer.Error{
+                kind: :startup,
+                raw: {:invalid_workspace_cwd, :workspace_root, _path}
+              }} =
                AppServer.run(workspace_root, "guard", issue)
 
-      assert {:error, {:invalid_workspace_cwd, :outside_workspace_root, _path, _root}} =
+      assert {:error,
+              %SymphonyElixir.AgentServer.Error{
+                kind: :startup,
+                raw: {:invalid_workspace_cwd, :outside_workspace_root, _path, _root}
+              }} =
                AppServer.run(outside_workspace, "guard", issue)
     after
       File.rm_rf(test_root)
@@ -69,11 +77,58 @@ defmodule SymphonyElixir.AppServerTest do
         labels: ["backend"]
       }
 
-      assert {:error, {:invalid_workspace_cwd, :symlink_escape, ^symlink_workspace, _root}} =
+      assert {:error,
+              %SymphonyElixir.AgentServer.Error{
+                kind: :startup,
+                raw: {:invalid_workspace_cwd, :symlink_escape, ^symlink_workspace, _root}
+              }} =
                AppServer.run(symlink_workspace, "guard", issue)
     after
       File.rm_rf(test_root)
     end
+  end
+
+  test "Codex local session 每轮重新 canonicalize workspace，start 后 symlink escape fail closed" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-codex-turn-local-#{System.unique_integer([:positive])}")
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "MT-TURN-GUARD")
+    outside = Path.join(test_root, "outside")
+    codex_binary = Path.join(test_root, "fake-codex")
+    turn_trace = Path.join(test_root, "turn.trace")
+    File.mkdir_p!(workspace)
+    File.mkdir_p!(outside)
+
+    File.write!(codex_binary, """
+    #!/bin/sh
+    while IFS= read -r line; do
+      case "$line" in
+        *'"method":"initialize"'*) printf '%s\n' '{"id":1,"result":{}}' ;;
+        *'"method":"thread/start"'*) printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-local-guard"}}}' ;;
+        *'"method":"turn/start"'*) touch #{shell_literal(turn_trace)}; printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-local-guard"}}}' '{"method":"turn/completed"}' ;;
+      esac
+    done
+    """)
+
+    File.chmod!(codex_binary, 0o755)
+    on_exit(fn -> File.rm_rf(test_root) end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      codex_command: "#{codex_binary} app-server"
+    )
+
+    issue = %Issue{id: "local-turn-guard", identifier: "MT-TURN-GUARD", title: "guard", state: "In Progress", url: "x"}
+    assert {:ok, session} = AppServer.start_session(workspace)
+    on_exit(fn -> AppServer.stop_session(session) end)
+    File.rm_rf!(workspace)
+    File.ln_s!(outside, workspace)
+    test_pid = self()
+
+    assert {:error, %SymphonyElixir.AgentServer.Error{kind: :startup}} =
+             AppServer.run_turn(session, "must not run", issue, on_message: &send(test_pid, {:guard_event, &1}))
+
+    assert_received {:guard_event, %SymphonyElixir.AgentServer.Event{type: :startup_failed}}
+    refute File.exists?(turn_trace)
   end
 
   test "turn timeout resets on stream updates and fires after silence" do
@@ -105,7 +160,7 @@ defmodule SymphonyElixir.AppServerTest do
             sleep 0.15
             printf '%s\n' '{"method":"item/updated","params":{"item":{"id":"two"}}}'
             sleep 0.15
-            printf '%s\n' '{"method":"turn/completed"}'
+            printf '%s\n' '{"method":"turn/completed","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}'
             exit 0
             ;;
           *) exit 0 ;;
@@ -159,10 +214,119 @@ defmodule SymphonyElixir.AppServerTest do
         codex_turn_timeout_ms: 100
       )
 
-      assert {:error, :turn_timeout} = AppServer.run(workspace, "silent turn", issue)
+      assert {:error,
+              %SymphonyElixir.AgentServer.Error{
+                kind: :timeout,
+                code: :turn_timeout,
+                raw: :turn_timeout
+              }} = AppServer.run(workspace, "silent turn", issue)
     after
       File.rm_rf(test_root)
     end
+  end
+
+  test "await_response 响应 agent_cancel，返回 typed cancelled 并清理启动中 Port" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-codex-start-cancel-#{System.unique_integer([:positive])}")
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "MT-START-CANCEL")
+    codex_binary = Path.join(test_root, "fake-codex")
+    pid_file = Path.join(test_root, "pid")
+    File.mkdir_p!(workspace)
+
+    File.write!(codex_binary, """
+    #!/bin/sh
+    printf '%s' "$$" > #{shell_literal(pid_file)}
+    while IFS= read -r _line; do
+      sleep 30
+    done
+    """)
+
+    File.chmod!(codex_binary, 0o755)
+    on_exit(fn -> File.rm_rf(test_root) end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      codex_command: "#{codex_binary} app-server",
+      codex_read_timeout_ms: 10_000
+    )
+
+    task = Task.async(fn -> AppServer.start_session(workspace) end)
+    assert wait_for_file(pid_file)
+    os_pid = pid_file |> File.read!() |> String.trim() |> String.to_integer()
+    send(task.pid, {:agent_cancel, :startup_cancel})
+
+    assert {:error,
+            %SymphonyElixir.AgentServer.Error{
+              kind: :cancelled,
+              code: :startup_cancel,
+              retryable?: false
+            }} = Task.await(task, 2_000)
+
+    assert wait_for_process_exit(os_pid)
+  end
+
+  test "turn receive loop 响应 agent_cancel，发送 cancelled 事件并执行 after cleanup" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-codex-turn-cancel-#{System.unique_integer([:positive])}")
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "MT-TURN-CANCEL")
+    codex_binary = Path.join(test_root, "fake-codex")
+    ready = Path.join(test_root, "ready")
+    pid_file = Path.join(test_root, "pid")
+    File.mkdir_p!(workspace)
+
+    File.write!(codex_binary, """
+    #!/bin/sh
+    printf '%s' "$$" > #{shell_literal(pid_file)}
+    while IFS= read -r line; do
+      case "$line" in
+        *'"method":"initialize"'*) printf '%s\n' '{"id":1,"result":{}}' ;;
+        *'"method":"thread/start"'*) printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-cancel"}}}' ;;
+        *'"method":"turn/start"'*)
+          printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-cancel"}}}'
+          touch #{shell_literal(ready)}
+          sleep 30
+          ;;
+      esac
+    done
+    """)
+
+    File.chmod!(codex_binary, 0o755)
+    on_exit(fn -> File.rm_rf(test_root) end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      codex_command: "#{codex_binary} app-server",
+      codex_turn_timeout_ms: 10_000
+    )
+
+    issue = %Issue{
+      id: "issue-turn-cancel",
+      identifier: "MT-TURN-CANCEL",
+      title: "Turn cancel",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-TURN-CANCEL"
+    }
+
+    test_pid = self()
+
+    task =
+      Task.async(fn ->
+        AppServer.run(workspace, "cancel", issue, on_message: &send(test_pid, {:cancel_event, &1}))
+      end)
+
+    assert wait_for_file(ready)
+    os_pid = pid_file |> File.read!() |> String.trim() |> String.to_integer()
+    send(task.pid, {:agent_cancel, :orchestrator_stop})
+
+    assert {:error,
+            %SymphonyElixir.AgentServer.Error{
+              kind: :cancelled,
+              code: :orchestrator_stop,
+              retryable?: false
+            }} = Task.await(task, 2_000)
+
+    assert_received {:cancel_event, %{event: :turn_cancelled, error: %{kind: :cancelled}}}
+    assert wait_for_process_exit(os_pid)
   end
 
   test "app server passes explicit turn sandbox policies through unchanged" do
@@ -342,7 +506,11 @@ defmodule SymphonyElixir.AppServerTest do
         labels: ["backend"]
       }
 
-      assert {:error, {:turn_input_required, payload}} =
+      assert {:error,
+              %SymphonyElixir.AgentServer.Error{
+                kind: :input_required,
+                raw: payload
+              }} =
                AppServer.run(workspace, "Needs input", issue)
 
       assert payload["method"] == "turn/input_required"
@@ -407,7 +575,11 @@ defmodule SymphonyElixir.AppServerTest do
         labels: ["backend"]
       }
 
-      assert {:error, {:turn_input_required, payload}} =
+      assert {:error,
+              %SymphonyElixir.AgentServer.Error{
+                kind: :input_required,
+                raw: payload
+              }} =
                AppServer.run(workspace, "Needs MCP input", issue)
 
       assert payload["method"] == "mcpServer/elicitation/request"
@@ -470,7 +642,11 @@ defmodule SymphonyElixir.AppServerTest do
         labels: ["backend"]
       }
 
-      assert {:error, {:approval_required, payload}} =
+      assert {:error,
+              %SymphonyElixir.AgentServer.Error{
+                kind: :approval_required,
+                raw: payload
+              }} =
                AppServer.run(workspace, "Handle approval request", issue)
 
       assert payload["method"] == "item/commandExecution/requestApproval"
@@ -776,7 +952,11 @@ defmodule SymphonyElixir.AppServerTest do
         labels: ["backend"]
       }
 
-      assert {:error, {:turn_input_required, payload}} =
+      assert {:error,
+              %SymphonyElixir.AgentServer.Error{
+                kind: :input_required,
+                raw: payload
+              }} =
                AppServer.run(workspace, "Handle generic tool input", issue)
 
       assert payload["method"] == "item/tool/requestUserInput"
@@ -846,7 +1026,11 @@ defmodule SymphonyElixir.AppServerTest do
         labels: ["backend"]
       }
 
-      assert {:error, {:turn_input_required, payload}} =
+      assert {:error,
+              %SymphonyElixir.AgentServer.Error{
+                kind: :input_required,
+                raw: payload
+              }} =
                AppServer.run(workspace, "Handle option based tool input", issue)
 
       assert payload["method"] == "item/tool/requestUserInput"
@@ -1315,7 +1499,10 @@ defmodule SymphonyElixir.AppServerTest do
                    AppServer.run(workspace, "Capture stderr log", issue, on_message: on_message)
         end)
 
-      assert_received {:app_server_message, %{event: :turn_completed}}
+      assert_received {:app_server_message, %{event: :turn_completed} = message}
+      refute is_struct(message)
+      refute is_struct(message.usage)
+      assert Jason.encode!(message)
       refute_received {:app_server_message, %{event: :malformed}}
       assert log =~ "Codex turn stream output: warning: this is stderr noise"
     after
@@ -1514,17 +1701,25 @@ defmodule SymphonyElixir.AppServerTest do
     try do
       trace_file = Path.join(test_root, "ssh.trace")
       fake_ssh = Path.join(test_root, "ssh")
-      remote_workspace = "/remote/workspaces/MT-REMOTE"
+      remote_root = Path.join(test_root, "remote-workspaces")
+      remote_workspace = Path.join(remote_root, "MT-REMOTE")
 
-      File.mkdir_p!(test_root)
+      File.mkdir_p!(remote_workspace)
+      {:ok, canonical_remote_workspace} = SymphonyElixir.PathSafety.canonicalize(remote_workspace)
       System.put_env("SYMP_TEST_SSH_TRACE", trace_file)
       System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
 
       File.write!(fake_ssh, """
       #!/bin/sh
       trace_file="${SYMP_TEST_SSH_TRACE:-/tmp/symphony-fake-ssh.trace}"
+      last=''
+      for arg in "$@"; do last="$arg"; done
       count=0
       printf 'ARGV:%s\\n' "$*" >> "$trace_file"
+
+      case "$last" in
+        *__SYMPHONY_WORKSPACE__*) eval "$last"; exit $? ;;
+      esac
 
       while IFS= read -r line; do
         count=$((count + 1))
@@ -1554,7 +1749,7 @@ defmodule SymphonyElixir.AppServerTest do
       File.chmod!(fake_ssh, 0o755)
 
       write_workflow_file!(Workflow.workflow_file_path(),
-        workspace_root: "/remote/workspaces",
+        workspace_root: remote_root,
         codex_command: "fake-remote-codex app-server"
       )
 
@@ -1579,17 +1774,18 @@ defmodule SymphonyElixir.AppServerTest do
       trace = File.read!(trace_file)
       lines = String.split(trace, "\n", trim: true)
 
-      assert argv_line = Enum.find(lines, &String.starts_with?(&1, "ARGV:"))
+      assert argv_line = Enum.find(lines, &(String.starts_with?(&1, "ARGV:") and String.contains?(&1, "fake-remote-codex")))
       assert argv_line =~ "-T -p 2200 worker-01 bash -lc"
       assert argv_line =~ "cd "
       assert argv_line =~ remote_workspace
-      assert argv_line =~ "unset LINEAR_API_KEY"
+      assert argv_line =~ "unset "
+      assert argv_line =~ ~r/\bLINEAR_API_KEY\b/
       assert argv_line =~ "exec "
       assert argv_line =~ "fake-remote-codex app-server"
 
       expected_turn_policy = %{
         "type" => "workspaceWrite",
-        "writableRoots" => [remote_workspace],
+        "writableRoots" => [canonical_remote_workspace],
         "readOnlyAccess" => %{"type" => "fullAccess"},
         "networkAccess" => false,
         "excludeTmpdirEnvVar" => false,
@@ -1603,7 +1799,7 @@ defmodule SymphonyElixir.AppServerTest do
                  |> Jason.decode!()
                  |> then(fn payload ->
                    payload["method"] == "thread/start" &&
-                     get_in(payload, ["params", "cwd"]) == remote_workspace
+                     get_in(payload, ["params", "cwd"]) == canonical_remote_workspace
                  end)
                else
                  false
@@ -1617,7 +1813,7 @@ defmodule SymphonyElixir.AppServerTest do
                  |> Jason.decode!()
                  |> then(fn payload ->
                    payload["method"] == "turn/start" &&
-                     get_in(payload, ["params", "cwd"]) == remote_workspace &&
+                     get_in(payload, ["params", "cwd"]) == canonical_remote_workspace &&
                      get_in(payload, ["params", "sandboxPolicy"]) == expected_turn_policy
                  end)
                else
@@ -1628,4 +1824,90 @@ defmodule SymphonyElixir.AppServerTest do
       File.rm_rf(test_root)
     end
   end
+
+  test "Codex SSH session 每轮重新校验 remote canonical root，symlink 漂移 fail closed" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-codex-turn-ssh-#{System.unique_integer([:positive])}")
+    previous_path = System.get_env("PATH")
+    fake_bin = Path.join(test_root, "bin")
+    fake_ssh = Path.join(fake_bin, "ssh")
+    remote_root = Path.join(test_root, "remote-root")
+    remote_workspace = Path.join(remote_root, "MT-REMOTE-GUARD")
+    outside = Path.join(test_root, "outside")
+    turn_trace = Path.join(test_root, "remote-turn.trace")
+    File.mkdir_p!(fake_bin)
+    File.mkdir_p!(remote_workspace)
+    File.mkdir_p!(outside)
+
+    File.write!(fake_ssh, """
+    #!/bin/sh
+    last=''
+    for arg in "$@"; do last="$arg"; done
+    case "$last" in
+      *fake-remote-codex*)
+        while IFS= read -r line; do
+          case "$line" in
+            *'"method":"initialize"'*) printf '%s\n' '{"id":1,"result":{}}' ;;
+            *'"method":"thread/start"'*) printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-remote-guard"}}}' ;;
+            *'"method":"turn/start"'*) touch #{shell_literal(turn_trace)}; printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-remote-guard"}}}' '{"method":"turn/completed"}' ;;
+          esac
+        done
+        ;;
+      *) eval "$last" ;;
+    esac
+    """)
+
+    File.chmod!(fake_ssh, 0o755)
+    System.put_env("PATH", fake_bin <> ":" <> (previous_path || ""))
+
+    on_exit(fn ->
+      restore_env("PATH", previous_path)
+      File.rm_rf(test_root)
+    end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: remote_root,
+      codex_command: "fake-remote-codex app-server"
+    )
+
+    issue = %Issue{id: "remote-turn-guard", identifier: "MT-REMOTE-GUARD", title: "guard", state: "In Progress", url: "x"}
+    assert {:ok, session} = AppServer.start_session(remote_workspace, worker_host: "worker-a")
+    on_exit(fn -> AppServer.stop_session(session) end)
+    File.rm_rf!(remote_workspace)
+    File.ln_s!(outside, remote_workspace)
+    test_pid = self()
+
+    assert {:error, %SymphonyElixir.AgentServer.Error{kind: :startup}} =
+             AppServer.run_turn(session, "must not run", issue, on_message: &send(test_pid, {:remote_guard_event, &1}))
+
+    assert_received {:remote_guard_event, %SymphonyElixir.AgentServer.Event{type: :startup_failed}}
+    refute File.exists?(turn_trace)
+  end
+
+  defp wait_for_file(path, attempts \\ 100)
+  defp wait_for_file(_path, 0), do: false
+
+  defp wait_for_file(path, attempts) do
+    if File.exists?(path) do
+      true
+    else
+      Process.sleep(10)
+      wait_for_file(path, attempts - 1)
+    end
+  end
+
+  defp wait_for_process_exit(os_pid, attempts \\ 100)
+  defp wait_for_process_exit(_os_pid, 0), do: false
+
+  defp wait_for_process_exit(os_pid, attempts) do
+    case System.cmd(System.find_executable("kill"), ["-0", Integer.to_string(os_pid)], stderr_to_stdout: true) do
+      {_output, 0} ->
+        Process.sleep(10)
+        wait_for_process_exit(os_pid, attempts - 1)
+
+      _ ->
+        true
+    end
+  end
+
+  defp shell_literal(value), do: "'" <> String.replace(value, "'", "'\"'\"'") <> "'"
 end

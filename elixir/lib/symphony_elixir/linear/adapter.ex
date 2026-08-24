@@ -43,7 +43,10 @@ defmodule SymphonyElixir.Linear.Adapter do
   end
 
   @spec secret_environment_names(map()) :: [String.t()]
-  def secret_environment_names(tracker_settings), do: tracker_settings.secret_environment_names
+  def secret_environment_names(tracker_settings) do
+    ["LINEAR_API_KEY" | Map.get(tracker_settings, :secret_environment_names, [])]
+    |> Enum.uniq()
+  end
 
   defp client_module do
     Application.get_env(:symphony_elixir, :linear_client_module, Client)
