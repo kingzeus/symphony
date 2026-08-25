@@ -12,13 +12,14 @@ defmodule SymphonyElixir.ClaudeCodeBackend do
 
   alias SymphonyElixir.AgentServer
   alias SymphonyElixir.AgentServer.{Approval, Error, Event, Usage, WorkspaceGuard}
-  alias SymphonyElixir.{Config, PathSafety, SSH, Tracker}
+  alias SymphonyElixir.{ClaudeTrackerMCP, Config, HttpServer, PathSafety, SSH, Tracker}
 
   @max_stream_frame_bytes 10_485_760
   @port_line_bytes @max_stream_frame_bytes + 1
   @post_exit_drain_ms 25
   @termination_grace_ms 250
   @mcp_config_file_placeholder "__SYMPHONY_CLAUDE_MCP_CONFIG_FILE__"
+  @tracker_mcp_path "/api/v1/agent-mcp"
   @transient_error_pattern ~r/(?:^|[^a-z0-9])(?:429|rate[_ -]?limit(?:ed)?|timeout|overload(?:ed)?|temporar(?:y|ily)|unavailable|connection(?:[_ -]?(?:reset|refused|closed|error))?|econnreset|econnrefused|too many requests)(?:$|[^a-z0-9])/
 
   @type session :: %{
@@ -94,7 +95,6 @@ defmodule SymphonyElixir.ClaudeCodeBackend do
     settings = session_runtime_settings(session)
     turn_id = "turn-#{session.turn_count + 1}"
     current_session_id = session.resume_session_id || session.session_id
-    args = cli_args(session, settings)
 
     base = %{
       session_id: current_session_id,
@@ -105,6 +105,23 @@ defmodule SymphonyElixir.ClaudeCodeBackend do
 
     Logger.info("Claude Code turn starting for #{issue_context(issue)} session_id=#{current_session_id} turn_id=#{turn_id} worker_host=#{worker_host_for_log(session.worker_host)}")
 
+    case prepare_tracker_mcp(session, issue, settings, current_session_id, turn_id) do
+      {:ok, turn_settings, tracker_mcp_token} ->
+        try do
+          run_prepared_turn(session, prompt, issue, on_message, base, turn_settings)
+        after
+          ClaudeTrackerMCP.close(tracker_mcp_token)
+        end
+
+      {:error, reason} ->
+        error = AgentServer.normalize_error(reason, :startup)
+        emit(on_message, :startup_failed, Map.merge(base, %{error: error, payload: reason}))
+        {:error, error}
+    end
+  end
+
+  defp run_prepared_turn(session, prompt, issue, on_message, base, settings) do
+    args = cli_args(session, settings)
     input = framed_input(settings.mcp_config, prompt)
 
     case start_port(session, settings, args, byte_size(prompt), mcp_config_bytes(settings.mcp_config)) do
@@ -124,21 +141,21 @@ defmodule SymphonyElixir.ClaudeCodeBackend do
                       turn_count: session.turn_count + 1
                   }
 
-                  Logger.info("Claude Code turn completed for #{issue_context(issue)} session_id=#{provider_session_id} turn_id=#{turn_id}")
+                  Logger.info("Claude Code turn completed for #{issue_context(issue)} session_id=#{provider_session_id} turn_id=#{base.turn_id}")
 
                   {:ok,
                    %{
                      result: :turn_completed,
                      session_id: provider_session_id,
                      thread_id: session.thread_id,
-                     turn_id: turn_id,
+                     turn_id: base.turn_id,
                      usage: usage,
                      payload: payload,
                      session: updated_session
                    }}
 
                 {:error, %Error{} = error} ->
-                  Logger.warning("Claude Code turn failed for #{issue_context(issue)} turn_id=#{turn_id} kind=#{error.kind} code=#{inspect(error.code)}")
+                  Logger.warning("Claude Code turn failed for #{issue_context(issue)} turn_id=#{base.turn_id} kind=#{error.kind} code=#{inspect(error.code)}")
 
                   {:error, error}
               end
@@ -155,6 +172,103 @@ defmodule SymphonyElixir.ClaudeCodeBackend do
         error = AgentServer.normalize_error(reason, :startup)
         emit(on_message, :startup_failed, Map.merge(base, %{error: error, payload: reason}))
         {:error, error}
+    end
+  end
+
+  defp prepare_tracker_mcp(%{worker_host: worker_host}, _issue, settings, _session_id, _turn_id)
+       when is_binary(worker_host) do
+    {:ok, settings, nil}
+  end
+
+  defp prepare_tracker_mcp(session, issue, settings, session_id, turn_id) do
+    tool_specs = Map.get(session.tracker_binding, :scoped_tool_specs, [])
+
+    if auto_tracker_mcp?(tool_specs, settings.mcp_config) do
+      open_tracker_mcp(session, issue, settings, session_id, turn_id, tool_specs)
+    else
+      {:ok, settings, nil}
+    end
+  end
+
+  defp auto_tracker_mcp?(tool_specs, mcp_config) do
+    tool_specs != [] and mergeable_mcp_config?(mcp_config) and not is_nil(tracker_mcp_port())
+  end
+
+  defp mergeable_mcp_config?(config) when is_binary(config), do: not is_nil(inline_mcp_payload(config))
+  defp mergeable_mcp_config?(_config), do: true
+
+  defp open_tracker_mcp(session, issue, settings, session_id, turn_id, tool_specs) do
+    case ClaudeTrackerMCP.open(
+           session.tracker_binding,
+           issue,
+           session_id,
+           turn_id,
+           ttl_ms: settings.turn_timeout_ms + 60_000
+         ) do
+      {:ok, token} -> prepare_opened_tracker_mcp(settings, tool_specs, token)
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp prepare_opened_tracker_mcp(settings, tool_specs, token) do
+    case merge_tracker_mcp_config(settings.mcp_config, token) do
+      {:ok, merged_config} ->
+        allowed_tools = Enum.uniq(settings.allowed_tools ++ tracker_mcp_allowed_tools(tool_specs))
+        {:ok, %{settings | mcp_config: merged_config, allowed_tools: allowed_tools}, token}
+
+      {:error, _reason} = error ->
+        ClaudeTrackerMCP.close(token)
+        error
+    end
+  end
+
+  defp merge_tracker_mcp_config(config, token) do
+    config_map = inline_mcp_payload(config) |> decode_inline_mcp_config()
+    servers = Map.get(config_map, "mcpServers", %{})
+    server_name = ClaudeTrackerMCP.server_name()
+
+    cond do
+      not is_map(servers) ->
+        {:error, :invalid_claude_mcp_servers}
+
+      Map.has_key?(servers, server_name) ->
+        {:error, :claude_tracker_mcp_name_conflict}
+
+      true ->
+        tracker_server = %{
+          "type" => "http",
+          "url" => tracker_mcp_url(),
+          "headers" => %{"Authorization" => "Bearer #{token}"}
+        }
+
+        {:ok, Map.put(config_map, "mcpServers", Map.put(servers, server_name, tracker_server))}
+    end
+  end
+
+  defp decode_inline_mcp_config(nil), do: %{}
+
+  defp decode_inline_mcp_config(payload) when is_binary(payload) do
+    Jason.decode!(payload)
+  end
+
+  defp tracker_mcp_allowed_tools(tool_specs) do
+    Enum.map(tool_specs, fn spec ->
+      "mcp__#{ClaudeTrackerMCP.server_name()}__#{Map.fetch!(spec, "name")}"
+    end)
+  end
+
+  defp tracker_mcp_url do
+    "http://#{tracker_mcp_host()}:#{tracker_mcp_port()}#{@tracker_mcp_path}"
+  end
+
+  defp tracker_mcp_port do
+    HttpServer.bound_port() || Config.server_port()
+  end
+
+  defp tracker_mcp_host do
+    case Config.settings!().server.host do
+      host when host in [nil, "", "0.0.0.0", "::", "[::]"] -> "127.0.0.1"
+      host -> host
     end
   end
 

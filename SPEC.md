@@ -539,7 +539,10 @@ Fields:
   - Passed as repeated `--disallowedTools` options.
 - `mcp_config` (string or object or null)
   - Passed to Claude Code's `--mcp-config`; objects are JSON encoded.
-  - This MUST NOT be described as a Codex DynamicTool compatibility bridge.
+  - For local workers with the Symphony HTTP server enabled, null/object/inline-object values MAY be
+    merged with a host-managed Tracker MCP entry backed by the selected adapter's issue-scoped tools.
+  - String/path values remain explicit pass-through configuration; remote workers require an
+    explicitly reachable MCP server.
 - `include_partial_messages` (boolean)
   - Default: `true`.
 - `turn_timeout_ms` (positive integer)
@@ -1199,9 +1202,16 @@ Unsupported dynamic tool calls:
 Optional provider-native agent tool extension:
 
 - An adapter MAY expose provider-native tools to the app-server session.
-- The current host-side DynamicTool bridge is a Codex app-server capability. A Claude Code backend
-  MAY pass an explicit MCP configuration to Claude, but MUST NOT silently represent Codex
-  DynamicTools as Claude tools.
+- Codex app-server receives provider-native tools through its DynamicTool protocol. A local Claude
+  Code turn MAY receive a separate adapter-defined issue-scoped tool set through a host-managed MCP
+  server. Raw provider-native tools MUST NOT be silently forwarded when they allow broader access
+  than the capability-bound issue. This is an MCP transport bridge, not an assertion that Claude
+  speaks the Codex app-server protocol.
+- The Claude MCP capability MUST be opaque, short-lived, and bound to one issue/session/turn. Raw
+  tracker credentials MUST remain in Symphony. The child receives only tool results, and the
+  capability MUST be revoked after the turn.
+- The exact generated MCP tool names SHOULD be added to Claude Code's allowed-tool set so approved
+  host tools do not become a second interactive approval boundary.
 - The selected adapter's tool specs SHOULD be advertised during session startup using the protocol
   mechanism supported by the targeted Codex app-server version.
 - Tool specs, adapter selection, and effective tracker settings MUST be bound to one session
@@ -1314,6 +1324,18 @@ Prompt and process safety:
   signals, and failures.
 - Declared tracker secret environment variables MUST be removed from the local or remote child
   environment before Claude starts.
+- When the local HTTP server is enabled and the selected adapter advertises issue-scoped tools, Symphony MAY
+  merge a `symphony_tracker` HTTP MCP server into null/object/inline-object `mcp_config`. Its bearer
+  token MUST be mode-`0600` temporary-config material, MUST identify one issue/session/turn without
+  containing the tracker credential, and MUST be revoked after the turn.
+- The host MCP endpoint MUST reject missing, expired, or revoked bearer tokens and MUST NOT log raw
+  tool inputs, tracker credentials, or capability tokens. Route dispatch logging SHOULD be disabled
+  and sensitive parameter keys filtered as defense in depth. The scoped adapter callback MUST derive
+  issue/comment/state targets from the bound issue and fixed host logic rather than caller IDs or raw
+  provider queries.
+- Host-managed error or blocked-report sections inside an agent-editable Workpad MUST survive scoped
+  progress updates unchanged. The scoped tool SHOULD strip child-supplied copies and reattach only
+  the existing host-authored section, preventing both silent history loss and forged host evidence.
 - Local canonical paths MUST remain below the configured workspace root; root execution, outside
   paths, and symlink escapes fail closed.
 - Local cleanup SHOULD terminate the complete provider process tree with `TERM`, then `KILL` after
@@ -1411,6 +1433,11 @@ Each adapter owns:
 - deriving `dispatchable` from provider-specific routing rules;
 - preserving provider-native state names while allowing case-insensitive scheduler comparison;
 - OPTIONAL provider-native agent tools and their authorization boundary.
+- OPTIONAL issue-scoped agent tools for backends that cannot consume the provider-native tool
+  protocol safely. Their tool specs and execution callback MUST be separate from raw provider tools.
+- OPTIONAL durable blocked-outcome reporting for the narrow case where a backend requires operator
+  action before the coding agent can use provider-native tracker tools. This callback remains
+  provider-specific and MUST NOT grow into generic tracker CRUD.
 
 The orchestrator MUST NOT inspect provider payloads, assume that `issue.id` is an underlying
 ticket ID, or branch on provider-specific blocker, board, transition, or comment semantics.
@@ -1481,15 +1508,21 @@ Orchestrator behavior on tracker errors:
 
 ### 11.5 Tracker Writes and Agent Tools (Important Boundary)
 
-Symphony does not require first-class tracker write APIs in the orchestrator.
+Symphony does not require general-purpose first-class tracker write APIs in the orchestrator.
 
 - Ticket mutations (state transitions, comments, attachments, PR metadata) are typically handled by
   the coding agent through the selected adapter's provider-native tools.
 - Tools execute in Symphony with the configured adapter credential; the child receives tool results,
   not a raw token.
+- An implementation MAY expose one narrow adapter callback to persist a typed non-retryable blocked
+  outcome when the coding agent cannot reach its tracker tools. Such a report MUST be idempotent,
+  MUST contain only sanitized provider-neutral error/approval metadata, MUST NOT include raw prompts,
+  tool inputs, or credentials, and SHOULD move the issue to a configured non-active waiting state so
+  restart recovery does not redispatch the same unresolved approval request.
 - The current normalized issue is available to tool execution as context, including opaque
   `native_ref`, so adapters can retain provider richness without adding it to the core scheduler.
-- The service remains a scheduler/runner and tracker reader.
+- The service remains a scheduler/runner and tracker reader apart from this optional blocked-handoff
+  escape hatch and provider-native agent tools.
 - Workflow-specific success often means "reached the next handoff state" (for example
   `Human Review`) rather than tracker terminal state `Done`.
 

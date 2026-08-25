@@ -21,13 +21,20 @@ defmodule SymphonyElixir.Tracker do
 
   @callback fetch_issues_by_states([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   @callback fetch_issues_by_ids([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
+  @callback report_blocked_issue(Issue.t(), map()) ::
+              {:ok, Issue.t()} | {:error, term()} | :unsupported
   @callback agent_tool_specs() :: [map()]
   @callback execute_agent_tool(String.t(), term(), keyword()) :: map()
+  @callback scoped_agent_tool_specs() :: [map()]
+  @callback execute_scoped_agent_tool(String.t(), term(), keyword()) :: map()
   @callback secret_environment_names(map()) :: [String.t()]
   @callback validate_config(map()) :: :ok | {:error, term()}
 
-  @optional_callbacks agent_tool_specs: 0,
+  @optional_callbacks report_blocked_issue: 2,
+                      agent_tool_specs: 0,
                       execute_agent_tool: 3,
+                      scoped_agent_tool_specs: 0,
+                      execute_scoped_agent_tool: 3,
                       validate_config: 1
 
   @spec fetch_issues_by_states([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
@@ -38,6 +45,25 @@ defmodule SymphonyElixir.Tracker do
   @spec fetch_issues_by_ids([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issues_by_ids(issue_ids) do
     adapter().fetch_issues_by_ids(issue_ids)
+  end
+
+  @doc """
+  Persists a sanitized blocked-agent report through the selected tracker.
+
+  This host-side escape hatch is intentionally separate from agent tools: a
+  backend can require approval before it has any chance to update the issue.
+  Adapters that do not support durable blocked reporting return `:unsupported`.
+  """
+  @spec report_blocked_issue(Issue.t(), map()) ::
+          {:ok, Issue.t()} | {:error, term()} | :unsupported
+  def report_blocked_issue(%Issue{} = issue, report) when is_map(report) do
+    adapter = adapter()
+
+    if Code.ensure_loaded?(adapter) and function_exported?(adapter, :report_blocked_issue, 2) do
+      adapter.report_blocked_issue(issue, report)
+    else
+      :unsupported
+    end
   end
 
   @doc """
@@ -54,6 +80,7 @@ defmodule SymphonyElixir.Tracker do
       adapter: adapter,
       tracker_settings: tracker_settings,
       tool_specs: adapter_agent_tool_specs(adapter),
+      scoped_tool_specs: adapter_scoped_agent_tool_specs(adapter),
       secret_environment_names: all_adapter_secret_environment_names(tracker_settings)
     }
   end
@@ -66,6 +93,21 @@ defmodule SymphonyElixir.Tracker do
         opts \\ []
       ) do
     execute_agent_tool_with_adapter(
+      adapter,
+      tool,
+      arguments,
+      Keyword.put(opts, :tracker_settings, tracker_settings)
+    )
+  end
+
+  @spec execute_bound_scoped_agent_tool(map(), String.t(), term(), keyword()) :: map()
+  def execute_bound_scoped_agent_tool(
+        %{adapter: adapter, tracker_settings: tracker_settings},
+        tool,
+        arguments,
+        opts \\ []
+      ) do
+    execute_scoped_agent_tool_with_adapter(
       adapter,
       tool,
       arguments,
@@ -111,9 +153,25 @@ defmodule SymphonyElixir.Tracker do
     end
   end
 
+  defp adapter_scoped_agent_tool_specs(adapter) do
+    if Code.ensure_loaded?(adapter) and function_exported?(adapter, :scoped_agent_tool_specs, 0) do
+      adapter.scoped_agent_tool_specs()
+    else
+      []
+    end
+  end
+
   defp execute_agent_tool_with_adapter(adapter, tool, arguments, opts) do
     if Code.ensure_loaded?(adapter) and function_exported?(adapter, :execute_agent_tool, 3) do
       adapter.execute_agent_tool(tool, arguments, opts)
+    else
+      unsupported_agent_tool_response(tool)
+    end
+  end
+
+  defp execute_scoped_agent_tool_with_adapter(adapter, tool, arguments, opts) do
+    if Code.ensure_loaded?(adapter) and function_exported?(adapter, :execute_scoped_agent_tool, 3) do
+      adapter.execute_scoped_agent_tool(tool, arguments, opts)
     else
       unsupported_agent_tool_response(tool)
     end

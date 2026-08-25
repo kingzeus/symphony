@@ -19,6 +19,11 @@ defmodule SymphonyElixir.ExtensionsTest do
       send(self(), {:fetch_issues_by_ids_called, issue_ids})
       {:ok, issue_ids}
     end
+
+    def report_blocked_issue(issue, report) do
+      send(self(), {:report_blocked_issue_called, issue, report})
+      {:ok, %{issue | state: report.target_state}}
+    end
   end
 
   defmodule SlowOrchestrator do
@@ -213,6 +218,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     binding = SymphonyElixir.Tracker.bind_agent_tools()
     assert binding.adapter == Memory
     assert binding.tool_specs == []
+    assert binding.scoped_tool_specs == []
 
     expected_secret_names =
       MapSet.new(~w[
@@ -235,6 +241,10 @@ defmodule SymphonyElixir.ExtensionsTest do
              "success"
            ] == false
 
+    assert SymphonyElixir.Tracker.execute_bound_scoped_agent_tool(binding, "not_a_memory_tool", %{})[
+             "success"
+           ] == false
+
     assert {:error, {:unsupported_tracker_kind, "future-tracker"}} =
              SymphonyElixir.Tracker.adapter_for_kind("future-tracker")
 
@@ -254,7 +264,30 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert {:ok, ["issue-1"]} = Adapter.fetch_issues_by_ids(["issue-1"])
     assert_receive {:fetch_issues_by_ids_called, ["issue-1"]}
 
+    issue = %Issue{id: "issue-blocked", identifier: "MT-BLOCKED", state: "Todo"}
+    report = %{target_state: "Human Review", message: "approval required"}
+
+    assert {:ok, %Issue{id: "issue-blocked", state: "Human Review"}} =
+             Adapter.report_blocked_issue(issue, report)
+
+    assert_receive {:report_blocked_issue_called, ^issue, ^report}
+
     assert [%{"name" => "linear_graphql"}] = Adapter.agent_tool_specs()
+
+    assert Enum.map(Adapter.scoped_agent_tool_specs(), & &1["name"]) == [
+             "tracker_issue_get",
+             "tracker_workpad_upsert",
+             "tracker_issue_transition"
+           ]
+
+    assert Adapter.execute_scoped_agent_tool("unsupported", %{}, [])["success"] == false
+  end
+
+  test "memory tracker rejects blocked reports without a waiting state" do
+    issue = %Issue{id: "issue-blocked", identifier: "MT-BLOCKED", state: "Todo"}
+
+    assert {:error, :missing_tracker_waiting_state} =
+             Memory.report_blocked_issue(issue, %{target_state: ""})
   end
 
   test "phoenix observability api preserves state, issue, and refresh responses" do

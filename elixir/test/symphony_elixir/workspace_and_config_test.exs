@@ -640,6 +640,175 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert log =~ "Variable \\\"$ids\\\" got invalid value"
   end
 
+  test "linear client creates a sanitized blocked Workpad and moves the issue to waiting state" do
+    issue = %Issue{
+      id: "issue-blocked",
+      identifier: "MT-BLOCKED",
+      title: "Blocked issue",
+      state: "Todo",
+      url: "https://example.test/MT-BLOCKED"
+    }
+
+    report = %{
+      target_state: "Human Review",
+      message: "Claude Code requires tool approval",
+      backend: :claude_code,
+      session_id: "session-blocked",
+      workspace_path: "/tmp/workspaces/MT-BLOCKED",
+      blocked_at: ~U[2026-08-25 03:34:13Z],
+      typed_error: %{kind: :approval_required, code: :permission_denied},
+      approval: %{kind: :tool, status: :required},
+      raw_tool_input: "must not be persisted"
+    }
+
+    graphql_fun = fn query, variables ->
+      send(self(), {:blocked_report_graphql, query, variables})
+
+      cond do
+        query =~ "SymphonyLinearBlockedReportContext" ->
+          {:ok,
+           %{
+             "data" => %{
+               "issue" => %{
+                 "id" => issue.id,
+                 "identifier" => issue.identifier,
+                 "state" => %{"name" => "Todo"},
+                 "team" => %{"id" => "team-1"},
+                 "comments" => %{"nodes" => []}
+               },
+               "workflowStates" => %{
+                 "nodes" => [
+                   %{"id" => "state-review", "name" => "Human Review", "team" => %{"id" => "team-1"}}
+                 ]
+               }
+             }
+           }}
+
+        query =~ "SymphonyLinearBlockedCommentCreate" ->
+          {:ok,
+           %{
+             "data" => %{
+               "commentCreate" => %{
+                 "success" => true,
+                 "comment" => %{"id" => "comment-1", "body" => variables.body}
+               }
+             }
+           }}
+
+        query =~ "SymphonyLinearBlockedIssueState" ->
+          {:ok,
+           %{
+             "data" => %{
+               "issueUpdate" => %{
+                 "success" => true,
+                 "issue" => %{
+                   "id" => issue.id,
+                   "identifier" => issue.identifier,
+                   "state" => %{"name" => "Human Review"}
+                 }
+               }
+             }
+           }}
+      end
+    end
+
+    assert {:ok, %Issue{state: "Human Review"}} =
+             Client.report_blocked_issue_for_test(issue, report, graphql_fun)
+
+    assert_receive {:blocked_report_graphql, context_query, %{issueId: "issue-blocked", targetState: "Human Review"}}
+    assert context_query =~ "SymphonyLinearBlockedReportContext"
+
+    assert_receive {:blocked_report_graphql, comment_query, %{issueId: "issue-blocked", body: body}}
+    assert comment_query =~ "SymphonyLinearBlockedCommentCreate"
+    assert body =~ "## Codex 工作台"
+    assert body =~ "## Symphony 运行阻塞"
+    assert body =~ "approval_required / permission_denied"
+    assert body =~ "Claude Code requires tool approval"
+    refute body =~ "must not be persisted"
+
+    assert_receive {:blocked_report_graphql, state_query, %{issueId: "issue-blocked", stateId: "state-review"}}
+    assert state_query =~ "SymphonyLinearBlockedIssueState"
+  end
+
+  test "linear blocked reporting replaces its marker block and does not re-transition waiting issues" do
+    issue = %Issue{
+      id: "issue-blocked-existing",
+      identifier: "MT-BLOCKED-EXISTING",
+      title: "Blocked issue with Workpad",
+      state: "Human Review"
+    }
+
+    existing_body = """
+    ## Codex 工作台
+
+    Existing evidence.
+
+    <!-- symphony:block-report:start -->
+    old blocked report
+    <!-- symphony:block-report:end -->
+    """
+
+    report = %{
+      target_state: "Human Review",
+      message: "approval still required",
+      backend: :claude_code,
+      typed_error: %{kind: :approval_required, code: :permission_denied},
+      approval: %{kind: :tool, status: :required}
+    }
+
+    graphql_fun = fn query, variables ->
+      send(self(), {:existing_blocked_report_graphql, query, variables})
+
+      cond do
+        query =~ "SymphonyLinearBlockedReportContext" ->
+          {:ok,
+           %{
+             "data" => %{
+               "issue" => %{
+                 "id" => issue.id,
+                 "identifier" => issue.identifier,
+                 "state" => %{"name" => "Human Review"},
+                 "team" => %{"id" => "team-1"},
+                 "comments" => %{
+                   "nodes" => [%{"id" => "comment-existing", "body" => existing_body}]
+                 }
+               },
+               "workflowStates" => %{
+                 "nodes" => [
+                   %{"id" => "state-review", "name" => "Human Review", "team" => %{"id" => "team-1"}}
+                 ]
+               }
+             }
+           }}
+
+        query =~ "SymphonyLinearBlockedCommentUpdate" ->
+          {:ok,
+           %{
+             "data" => %{
+               "commentUpdate" => %{
+                 "success" => true,
+                 "comment" => %{"id" => "comment-existing", "body" => variables.body}
+               }
+             }
+           }}
+      end
+    end
+
+    assert {:ok, %Issue{state: "Human Review"}} =
+             Client.report_blocked_issue_for_test(issue, report, graphql_fun)
+
+    assert_receive {:existing_blocked_report_graphql, context_query, %{issueId: "issue-blocked-existing", targetState: "Human Review"}}
+    assert context_query =~ "SymphonyLinearBlockedReportContext"
+
+    assert_receive {:existing_blocked_report_graphql, update_query, %{commentId: "comment-existing", body: body}}
+    assert update_query =~ "SymphonyLinearBlockedCommentUpdate"
+    assert body =~ "Existing evidence."
+    assert body =~ "approval still required"
+    refute body =~ "old blocked report"
+    assert length(Regex.scan(~r/<!-- symphony:block-report:start -->/, body)) == 1
+    refute_received {:existing_blocked_report_graphql, _query, _variables}
+  end
+
   test "linear graphql honors a bound tracker-settings snapshot without loading live config" do
     parent = self()
     original_workflow_path = Workflow.workflow_file_path()

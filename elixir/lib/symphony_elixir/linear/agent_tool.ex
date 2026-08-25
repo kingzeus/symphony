@@ -6,6 +6,12 @@ defmodule SymphonyElixir.Linear.AgentTool do
   alias SymphonyElixir.Linear.Client
 
   @linear_graphql_tool "linear_graphql"
+  @scoped_issue_get_tool "tracker_issue_get"
+  @scoped_workpad_upsert_tool "tracker_workpad_upsert"
+  @scoped_issue_transition_tool "tracker_issue_transition"
+  @max_workpad_body_bytes 200_000
+  @blocked_report_start "<!-- symphony:block-report:start -->"
+  @blocked_report_end "<!-- symphony:block-report:end -->"
   @linear_graphql_description """
   Execute a raw GraphQL query or mutation against Linear using Symphony's configured auth.
   """
@@ -25,6 +31,86 @@ defmodule SymphonyElixir.Linear.AgentTool do
       }
     }
   }
+
+  @scoped_issue_query """
+  query SymphonyScopedIssue($issueId: String!) {
+    issue(id: $issueId) {
+      id
+      identifier
+      title
+      url
+      state { name type }
+      labels { nodes { name } }
+      project { id name }
+      team { id key }
+      comments(first: 100) {
+        nodes {
+          id
+          body
+          createdAt
+          updatedAt
+          resolvedAt
+          user { name }
+        }
+      }
+    }
+  }
+  """
+
+  @scoped_workpad_context_query """
+  query SymphonyScopedWorkpadContext($issueId: String!) {
+    issue(id: $issueId) {
+      id
+      comments(first: 100) {
+        nodes { id body resolvedAt }
+      }
+    }
+  }
+  """
+
+  @scoped_workpad_create_mutation """
+  mutation SymphonyScopedWorkpadCreate($issueId: String!, $body: String!) {
+    commentCreate(input: {issueId: $issueId, body: $body}) {
+      success
+      comment { id updatedAt }
+    }
+  }
+  """
+
+  @scoped_workpad_update_mutation """
+  mutation SymphonyScopedWorkpadUpdate($commentId: String!, $body: String!) {
+    commentUpdate(id: $commentId, input: {body: $body}) {
+      success
+      comment { id updatedAt }
+    }
+  }
+  """
+
+  @scoped_transition_context_query """
+  query SymphonyScopedTransitionContext($issueId: String!, $targetState: String!) {
+    issue(id: $issueId) {
+      id
+      state { name }
+      team { id }
+    }
+    workflowStates(filter: {name: {eq: $targetState}}, first: 50) {
+      nodes {
+        id
+        name
+        team { id }
+      }
+    }
+  }
+  """
+
+  @scoped_transition_mutation """
+  mutation SymphonyScopedIssueTransition($issueId: String!, $stateId: String!) {
+    issueUpdate(id: $issueId, input: {stateId: $stateId}) {
+      success
+      issue { id identifier state { name } }
+    }
+  }
+  """
 
   @spec execute(String.t() | nil, term(), keyword()) :: map()
   def execute(tool, arguments, opts) do
@@ -53,6 +139,68 @@ defmodule SymphonyElixir.Linear.AgentTool do
     ]
   end
 
+  @doc """
+  Returns the issue-scoped tools exposed through the Claude Tracker MCP bridge.
+
+  These tools never accept raw GraphQL, issue IDs, comment IDs, or state IDs.
+  Symphony derives every target from the turn capability and fixed host queries.
+  """
+  @spec scoped_tool_specs() :: [map()]
+  def scoped_tool_specs do
+    [
+      %{
+        "name" => @scoped_issue_get_tool,
+        "description" => "Read the current capability-bound Linear issue and its comments.",
+        "inputSchema" => %{
+          "type" => "object",
+          "additionalProperties" => false,
+          "properties" => %{}
+        }
+      },
+      %{
+        "name" => @scoped_workpad_upsert_tool,
+        "description" => "Create or update the single active Workpad on the current capability-bound Linear issue.",
+        "inputSchema" => %{
+          "type" => "object",
+          "additionalProperties" => false,
+          "required" => ["body"],
+          "properties" => %{
+            "body" => %{
+              "type" => "string",
+              "maxLength" => @max_workpad_body_bytes,
+              "description" => "Complete Workpad Markdown beginning with `## Codex 工作台` or `## Codex Workpad`."
+            }
+          }
+        }
+      },
+      %{
+        "name" => @scoped_issue_transition_tool,
+        "description" => "Move the current capability-bound Linear issue to a configured workflow state by name.",
+        "inputSchema" => %{
+          "type" => "object",
+          "additionalProperties" => false,
+          "required" => ["state"],
+          "properties" => %{
+            "state" => %{
+              "type" => "string",
+              "description" => "Target state name from the workflow's configured active, waiting, or terminal states."
+            }
+          }
+        }
+      }
+    ]
+  end
+
+  @spec execute_scoped(String.t() | nil, term(), keyword()) :: map()
+  def execute_scoped(tool, arguments, opts) do
+    case tool do
+      @scoped_issue_get_tool -> execute_scoped_issue_get(arguments, opts)
+      @scoped_workpad_upsert_tool -> execute_scoped_workpad_upsert(arguments, opts)
+      @scoped_issue_transition_tool -> execute_scoped_issue_transition(arguments, opts)
+      other -> unsupported_scoped_tool_response(other)
+    end
+  end
+
   defp execute_linear_graphql(arguments, opts) do
     linear_client = Keyword.get(opts, :linear_client, &Client.graphql/3)
     client_opts = Keyword.take(opts, [:tracker_settings])
@@ -64,6 +212,425 @@ defmodule SymphonyElixir.Linear.AgentTool do
       {:error, reason} ->
         failure_response(tool_error_payload(reason))
     end
+  end
+
+  defp execute_scoped_issue_get(arguments, opts) do
+    linear_client = Keyword.get(opts, :linear_client, &Client.graphql/3)
+    client_opts = Keyword.take(opts, [:tracker_settings])
+
+    with :ok <- validate_argument_keys(arguments, []),
+         {:ok, issue_id} <- scoped_issue_id(opts),
+         {:ok, response} <- linear_client.(@scoped_issue_query, %{issueId: issue_id}, client_opts),
+         {:ok, issue} <- decode_scoped_issue(response, issue_id) do
+      success_payload(%{"issue" => issue})
+    else
+      {:error, reason} -> scoped_failure_response(reason)
+    end
+  end
+
+  defp execute_scoped_workpad_upsert(arguments, opts) do
+    linear_client = Keyword.get(opts, :linear_client, &Client.graphql/3)
+    client_opts = Keyword.take(opts, [:tracker_settings])
+
+    with :ok <- validate_argument_keys(arguments, ["body"]),
+         {:ok, body} <- normalize_workpad_body(arguments),
+         {:ok, issue_id} <- scoped_issue_id(opts),
+         {:ok, context_response} <-
+           linear_client.(@scoped_workpad_context_query, %{issueId: issue_id}, client_opts),
+         {:ok, workpad} <- decode_workpad_context(context_response, issue_id),
+         {:ok, persisted_body} <- preserve_host_managed_workpad_sections(workpad, body),
+         {:ok, operation, response} <-
+           upsert_scoped_workpad(linear_client, client_opts, issue_id, workpad, persisted_body),
+         {:ok, comment} <- decode_workpad_mutation(response, operation, workpad) do
+      success_payload(%{"operation" => Atom.to_string(operation), "comment" => comment})
+    else
+      {:error, reason} -> scoped_failure_response(reason)
+    end
+  end
+
+  defp execute_scoped_issue_transition(arguments, opts) do
+    linear_client = Keyword.get(opts, :linear_client, &Client.graphql/3)
+    client_opts = Keyword.take(opts, [:tracker_settings])
+
+    with :ok <- validate_argument_keys(arguments, ["state"]),
+         {:ok, target_state} <- normalize_target_state(arguments, opts),
+         {:ok, issue_id} <- scoped_issue_id(opts),
+         {:ok, context_response} <-
+           linear_client.(
+             @scoped_transition_context_query,
+             %{issueId: issue_id, targetState: target_state},
+             client_opts
+           ),
+         {:ok, context} <- decode_transition_context(context_response, issue_id, target_state),
+         {:ok, result} <-
+           transition_scoped_issue(linear_client, client_opts, issue_id, target_state, context) do
+      success_payload(result)
+    else
+      {:error, reason} -> scoped_failure_response(reason)
+    end
+  end
+
+  defp validate_argument_keys(arguments, allowed_keys) when is_map(arguments) do
+    normalized_keys = Enum.map(Map.keys(arguments), &to_string/1)
+
+    if Enum.all?(normalized_keys, &(&1 in allowed_keys)) do
+      :ok
+    else
+      {:error, :invalid_scoped_arguments}
+    end
+  end
+
+  defp validate_argument_keys(_arguments, _allowed_keys), do: {:error, :invalid_scoped_arguments}
+
+  defp scoped_issue_id(opts) do
+    case Keyword.get(opts, :issue) do
+      issue when is_map(issue) ->
+        case Map.get(issue, :id) || Map.get(issue, "id") do
+          issue_id when is_binary(issue_id) and issue_id != "" -> {:ok, issue_id}
+          _other -> {:error, :missing_scoped_issue}
+        end
+
+      _other ->
+        {:error, :missing_scoped_issue}
+    end
+  end
+
+  defp decode_scoped_issue(%{"data" => %{"issue" => %{"id" => issue_id} = issue}}, issue_id),
+    do: {:ok, issue}
+
+  defp decode_scoped_issue(%{"data" => %{"issue" => nil}}, _issue_id),
+    do: {:error, :scoped_issue_not_found}
+
+  defp decode_scoped_issue(%{"errors" => errors} = response, _issue_id) when is_list(errors),
+    do: {:error, {:graphql_response, response}}
+
+  defp decode_scoped_issue(_response, _issue_id), do: {:error, :linear_unknown_payload}
+
+  defp normalize_workpad_body(arguments) do
+    case Map.get(arguments, "body") || Map.get(arguments, :body) do
+      body when is_binary(body) ->
+        trimmed_body = String.trim(body)
+
+        cond do
+          trimmed_body == "" -> {:error, :invalid_workpad_body}
+          byte_size(body) > @max_workpad_body_bytes -> {:error, :workpad_body_too_large}
+          not workpad_body?(trimmed_body) -> {:error, :invalid_workpad_header}
+          true -> {:ok, trimmed_body <> "\n"}
+        end
+
+      _other ->
+        {:error, :invalid_workpad_body}
+    end
+  end
+
+  defp decode_workpad_context(
+         %{"data" => %{"issue" => %{"id" => issue_id, "comments" => %{"nodes" => comments}}}},
+         issue_id
+       )
+       when is_list(comments) do
+    workpads = Enum.filter(comments, &active_workpad?/1)
+
+    case workpads do
+      [] -> {:ok, nil}
+      [%{"id" => id} = workpad] when is_binary(id) -> {:ok, workpad}
+      [_first | _rest] -> {:error, :multiple_active_workpads}
+    end
+  end
+
+  defp decode_workpad_context(%{"data" => %{"issue" => nil}}, _issue_id),
+    do: {:error, :scoped_issue_not_found}
+
+  defp decode_workpad_context(%{"errors" => errors} = response, _issue_id) when is_list(errors),
+    do: {:error, {:graphql_response, response}}
+
+  defp decode_workpad_context(_response, _issue_id), do: {:error, :linear_unknown_payload}
+
+  defp active_workpad?(comment) when is_map(comment) do
+    is_nil(Map.get(comment, "resolvedAt")) and workpad_body?(Map.get(comment, "body"))
+  end
+
+  defp active_workpad?(_comment), do: false
+
+  defp workpad_body?(body) when is_binary(body) do
+    Regex.match?(~r/\A## Codex (工作台|Workpad)\s*(?:\r?\n|\z)/, body)
+  end
+
+  defp workpad_body?(_body), do: false
+
+  defp preserve_host_managed_workpad_sections(workpad, body) do
+    preserved_section =
+      case workpad do
+        %{"body" => existing_body} when is_binary(existing_body) -> extract_blocked_report(existing_body)
+        _other -> nil
+      end
+
+    agent_body = strip_blocked_reports(body) |> String.trim_trailing()
+
+    persisted_body =
+      case preserved_section do
+        section when is_binary(section) -> agent_body <> "\n\n" <> section <> "\n"
+        nil -> agent_body <> "\n"
+      end
+
+    if byte_size(persisted_body) <= @max_workpad_body_bytes do
+      {:ok, persisted_body}
+    else
+      {:error, :workpad_body_too_large}
+    end
+  end
+
+  defp extract_blocked_report(body) do
+    case Regex.run(blocked_report_pattern(), body) do
+      [section] -> section
+      _other -> nil
+    end
+  end
+
+  defp strip_blocked_reports(body), do: Regex.replace(blocked_report_pattern(), body, "")
+
+  defp blocked_report_pattern do
+    Regex.compile!(
+      Regex.escape(@blocked_report_start) <> ".*?" <> Regex.escape(@blocked_report_end),
+      "s"
+    )
+  end
+
+  defp upsert_scoped_workpad(linear_client, client_opts, issue_id, nil, body) do
+    case linear_client.(
+           @scoped_workpad_create_mutation,
+           %{issueId: issue_id, body: body},
+           client_opts
+         ) do
+      {:ok, response} -> {:ok, :created, response}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp upsert_scoped_workpad(linear_client, client_opts, _issue_id, %{"id" => comment_id}, body) do
+    case linear_client.(
+           @scoped_workpad_update_mutation,
+           %{commentId: comment_id, body: body},
+           client_opts
+         ) do
+      {:ok, response} -> {:ok, :updated, response}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp decode_workpad_mutation(
+         %{"data" => %{"commentCreate" => %{"success" => true, "comment" => %{"id" => id} = comment}}},
+         :created,
+         nil
+       )
+       when is_binary(id),
+       do: {:ok, comment}
+
+  defp decode_workpad_mutation(
+         %{"data" => %{"commentUpdate" => %{"success" => true, "comment" => %{"id" => id} = comment}}},
+         :updated,
+         %{"id" => id}
+       )
+       when is_binary(id),
+       do: {:ok, comment}
+
+  defp decode_workpad_mutation(%{"errors" => errors} = response, _operation, _workpad)
+       when is_list(errors),
+       do: {:error, {:graphql_response, response}}
+
+  defp decode_workpad_mutation(_response, _operation, _workpad),
+    do: {:error, :linear_unknown_payload}
+
+  defp normalize_target_state(arguments, opts) do
+    with state when is_binary(state) <- Map.get(arguments, "state") || Map.get(arguments, :state),
+         normalized when normalized != "" <- normalize_state_name(state),
+         tracker_settings when is_map(tracker_settings) <- Keyword.get(opts, :tracker_settings),
+         allowed_states when is_list(allowed_states) <- configured_states(tracker_settings),
+         target_state when is_binary(target_state) <-
+           Enum.find(allowed_states, &(normalize_state_name(&1) == normalized)) do
+      {:ok, target_state}
+    else
+      nil -> {:error, :target_state_not_allowed}
+      "" -> {:error, :invalid_target_state}
+      _other -> {:error, :invalid_target_state}
+    end
+  end
+
+  defp configured_states(tracker_settings) do
+    [:active_states, :waiting_states, :terminal_states]
+    |> Enum.flat_map(fn key ->
+      case Map.get(tracker_settings, key) || Map.get(tracker_settings, Atom.to_string(key)) do
+        states when is_list(states) -> states
+        _other -> []
+      end
+    end)
+    |> Enum.filter(&is_binary/1)
+    |> Enum.uniq_by(&normalize_state_name/1)
+  end
+
+  defp decode_transition_context(
+         %{
+           "data" => %{
+             "issue" => %{
+               "id" => issue_id,
+               "state" => %{"name" => current_state},
+               "team" => %{"id" => team_id}
+             },
+             "workflowStates" => %{"nodes" => states}
+           }
+         },
+         issue_id,
+         target_state
+       )
+       when is_binary(current_state) and is_binary(team_id) and is_list(states) do
+    target =
+      Enum.find(states, fn
+        %{"id" => state_id, "name" => state_name, "team" => %{"id" => state_team_id}}
+        when is_binary(state_id) and is_binary(state_name) and is_binary(state_team_id) ->
+          state_team_id == team_id and normalize_state_name(state_name) == normalize_state_name(target_state)
+
+        _other ->
+          false
+      end)
+
+    case target do
+      %{"id" => state_id} -> {:ok, %{current_state: current_state, target_state_id: state_id}}
+      nil -> {:error, :target_state_not_found}
+    end
+  end
+
+  defp decode_transition_context(%{"data" => %{"issue" => nil}}, _issue_id, _target_state),
+    do: {:error, :scoped_issue_not_found}
+
+  defp decode_transition_context(%{"errors" => errors} = response, _issue_id, _target_state)
+       when is_list(errors),
+       do: {:error, {:graphql_response, response}}
+
+  defp decode_transition_context(_response, _issue_id, _target_state),
+    do: {:error, :linear_unknown_payload}
+
+  defp transition_scoped_issue(
+         linear_client,
+         client_opts,
+         issue_id,
+         target_state,
+         %{current_state: current_state, target_state_id: state_id}
+       ) do
+    if normalize_state_name(current_state) == normalize_state_name(target_state) do
+      {:ok, %{"changed" => false, "state" => current_state}}
+    else
+      with {:ok, response} <-
+             linear_client.(
+               @scoped_transition_mutation,
+               %{issueId: issue_id, stateId: state_id},
+               client_opts
+             ) do
+        decode_transition_mutation(response, issue_id, target_state)
+      end
+    end
+  end
+
+  defp decode_transition_mutation(
+         %{
+           "data" => %{
+             "issueUpdate" => %{
+               "success" => true,
+               "issue" => %{"id" => issue_id, "state" => %{"name" => state_name}}
+             }
+           }
+         },
+         issue_id,
+         target_state
+       )
+       when is_binary(state_name) do
+    if normalize_state_name(state_name) == normalize_state_name(target_state) do
+      {:ok, %{"changed" => true, "state" => state_name}}
+    else
+      {:error, :linear_state_mismatch}
+    end
+  end
+
+  defp decode_transition_mutation(%{"errors" => errors} = response, _issue_id, _target_state)
+       when is_list(errors),
+       do: {:error, {:graphql_response, response}}
+
+  defp decode_transition_mutation(_response, _issue_id, _target_state),
+    do: {:error, :linear_unknown_payload}
+
+  defp normalize_state_name(value) when is_binary(value) do
+    value |> String.trim() |> String.downcase()
+  end
+
+  defp success_payload(payload), do: dynamic_tool_response(true, encode_payload(payload))
+
+  defp scoped_failure_response({:graphql_response, response}), do: failure_response(response)
+  defp scoped_failure_response(reason), do: failure_response(scoped_tool_error_payload(reason))
+
+  defp scoped_tool_error_payload(:invalid_scoped_arguments) do
+    %{"error" => %{"message" => "Scoped tracker tool arguments do not match the advertised schema."}}
+  end
+
+  defp scoped_tool_error_payload(:missing_scoped_issue) do
+    %{"error" => %{"message" => "The tracker capability is missing its bound issue context."}}
+  end
+
+  defp scoped_tool_error_payload(:scoped_issue_not_found) do
+    %{"error" => %{"message" => "The capability-bound Linear issue was not found."}}
+  end
+
+  defp scoped_tool_error_payload(:invalid_workpad_body) do
+    %{"error" => %{"message" => "`tracker_workpad_upsert.body` must be a non-empty string."}}
+  end
+
+  defp scoped_tool_error_payload(:workpad_body_too_large) do
+    %{"error" => %{"message" => "The Workpad body exceeds the 200000-byte limit."}}
+  end
+
+  defp scoped_tool_error_payload(:invalid_workpad_header) do
+    %{
+      "error" => %{
+        "message" => "The Workpad body must begin with `## Codex 工作台` or `## Codex Workpad`."
+      }
+    }
+  end
+
+  defp scoped_tool_error_payload(:multiple_active_workpads) do
+    %{
+      "error" => %{
+        "message" => "Multiple active Workpad comments exist; refusing to choose or delete one automatically."
+      }
+    }
+  end
+
+  defp scoped_tool_error_payload(:invalid_target_state) do
+    %{"error" => %{"message" => "`tracker_issue_transition.state` must be a non-empty configured state name."}}
+  end
+
+  defp scoped_tool_error_payload(:target_state_not_allowed) do
+    %{
+      "error" => %{
+        "message" => "The requested state is outside the workflow's configured active, waiting, and terminal states."
+      }
+    }
+  end
+
+  defp scoped_tool_error_payload(:target_state_not_found) do
+    %{"error" => %{"message" => "The requested state was not found for the capability-bound issue's team."}}
+  end
+
+  defp scoped_tool_error_payload(:linear_state_mismatch) do
+    %{"error" => %{"message" => "Linear returned a different state after the scoped issue transition."}}
+  end
+
+  defp scoped_tool_error_payload(:linear_unknown_payload), do: tool_error_payload(:linear_unknown_payload)
+  defp scoped_tool_error_payload(reason), do: tool_error_payload(reason)
+
+  defp unsupported_scoped_tool_response(tool) do
+    failure_response(%{
+      "error" => %{
+        "message" => "Unsupported scoped tracker tool: #{inspect(tool)}.",
+        "supportedTools" => Enum.map(scoped_tool_specs(), & &1["name"])
+      }
+    })
   end
 
   defp normalize_linear_graphql_arguments(arguments) when is_binary(arguments) do

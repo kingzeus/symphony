@@ -26,17 +26,26 @@ During Codex app-server sessions, the selected tracker adapter may advertise pro
 Linear serves `linear_graphql`, GitHub Issues serves `github_api`, Jira Cloud serves
 `jira_rest`, Asana serves `asana_api`, and GitLab serves `gitlab_api`. Symphony executes those
 tools with configured host-side auth and removes declared tracker-token environment variables from
-the Codex child, so the agent does not need a second tracker login. The Claude Code backend does not
-pretend these DynamicTools are Claude tools; use `claude_code.mcp_config` for an explicit Claude MCP
-configuration when needed.
+the Codex child, so the agent does not need a second tracker login. For local Claude Code turns with
+the HTTP server enabled, adapters may expose a separate issue-scoped MCP contract. The Linear bridge
+offers only `tracker_issue_get`, `tracker_workpad_upsert`, and `tracker_issue_transition`; it never
+exposes raw `linear_graphql`, issue/comment/state IDs supplied by the child, or comment deletion.
+Claude receives an opaque issue/session/turn-bound bearer token in its mode-`0600` temporary MCP
+config; the tracker credential stays in the Symphony BEAM and the exact scoped tool names are added
+to that turn's `--allowedTools`. Remote workers and string/path `claude_code.mcp_config` values keep
+explicit pass-through behavior.
 
 If a claimed issue moves to a terminal state (`Done`, `Closed`, `Cancelled`, or `Duplicate`),
 Symphony stops the active agent for that issue and cleans up matching workspaces.
 
-If the selected backend reports that operator input or approval is required, Symphony keeps the
-issue claimed and exposes it as blocked in the runtime state, JSON API, and dashboard. Blocked
-entries are in memory only; restarting the orchestrator clears that blocked map, so any still-active
-tracker issue can become a dispatch candidate again after restart.
+If the selected backend reports that operator input or approval is required, Symphony exposes the
+typed failure as blocked in the runtime state, JSON API, and dashboard. Adapters may also implement
+the narrow host-side blocked-report callback for the failure path where the agent cannot reach its
+tracker tools. The Linear adapter upserts a sanitized `## Symphony 运行阻塞` section in the existing
+`## Codex 工作台` comment (or creates that Workpad) and moves the issue to the first configured
+`tracker.waiting_states` entry, normally `Human Review`. It never persists raw prompts, tool inputs,
+or credentials. Trackers without that optional callback keep the blocked entry in memory only;
+restarting the orchestrator clears that map, so a still-active tracker issue may dispatch again.
 
 ## How to use it
 
@@ -177,7 +186,11 @@ Notes:
   strongly isolated worker with least-privilege credentials; Symphony never selects it by default.
 - `claude_code.allowed_tools` and `claude_code.disallowed_tools` are repeated CLI tool filters.
   `claude_code.mcp_config` accepts either a string/path understood by Claude Code or a map encoded as
-  JSON. This is pass-through configuration, not a host-side Codex DynamicTool bridge.
+  JSON. Local turns merge map/inline-object config with Symphony's authenticated Tracker MCP when
+  the HTTP server is enabled and the adapter advertises issue-scoped tools. A string/path config is
+  left untouched, and SSH workers require an explicitly reachable MCP configuration. The capability
+  token is revoked after the turn and does not contain the tracker credential. Raw Codex
+  DynamicTools are not silently forwarded to Claude.
 - `claude_code.include_partial_messages` defaults to `true`.
 - `claude_code.turn_timeout_ms` is the Claude stream silence timeout. Partial messages and other
   valid `stream-json` frames reset it. `claude_code.stall_timeout_ms` is the corresponding
@@ -278,7 +291,20 @@ claude_code:
   to `tracker_config` or `tracker_auth`, request failures to `tracker_transport`, non-200 responses to
   `tracker_response` (`429` is `tracker_rate_limited`), GraphQL/unknown payload failures to
   `tracker_payload`, and missing cursors to `tracker_pagination`; logs and tool responses carry the
-  human-readable provider detail.
+  human-readable provider detail. On a typed non-retryable blocked agent outcome, the adapter's
+  host-side blocked reporter idempotently replaces its delimited Workpad section and transitions the
+  issue to the first configured waiting state after the comment mutation succeeds. A comment/state
+  mutation failure remains visible in Symphony logs and the in-memory blocked entry.
+- Claude MCP scope: local Claude turns receive `tracker_issue_get`,
+  `tracker_workpad_upsert`, and `tracker_issue_transition` instead of raw `linear_graphql`. Fixed host
+  queries derive the issue ID from the capability, select the current issue's single active Workpad,
+  and resolve configured state names to the current issue team's state ID. Arbitrary issue reads,
+  caller-selected IDs, extra comments, attachments, and destructive comment mutations are rejected.
+  Host-managed `symphony:block-report` sections are immutable through this tool: agent-supplied
+  copies are stripped and the existing host section is reattached unchanged, so later progress
+  updates cannot silently erase or forge approval/error history.
+  The MCP route suppresses dispatch parameter logging, with Phoenix parameter filters as defense in
+  depth; operational logs retain only issue/session/turn/tool/success metadata.
 
 ### GitHub Issues adapter
 

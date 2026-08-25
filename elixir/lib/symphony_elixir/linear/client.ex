@@ -104,6 +104,57 @@ defmodule SymphonyElixir.Linear.Client do
   }
   """
 
+  @blocked_report_context_query """
+  query SymphonyLinearBlockedReportContext($issueId: String!, $targetState: String!) {
+    issue(id: $issueId) {
+      id
+      identifier
+      state { name }
+      team { id }
+      comments(first: 100) {
+        nodes { id body }
+      }
+    }
+    workflowStates(filter: {name: {eq: $targetState}}, first: 50) {
+      nodes {
+        id
+        name
+        team { id }
+      }
+    }
+  }
+  """
+
+  @blocked_comment_create_mutation """
+  mutation SymphonyLinearBlockedCommentCreate($issueId: String!, $body: String!) {
+    commentCreate(input: {issueId: $issueId, body: $body}) {
+      success
+      comment { id body }
+    }
+  }
+  """
+
+  @blocked_comment_update_mutation """
+  mutation SymphonyLinearBlockedCommentUpdate($commentId: String!, $body: String!) {
+    commentUpdate(id: $commentId, input: {body: $body}) {
+      success
+      comment { id body }
+    }
+  }
+  """
+
+  @blocked_issue_state_mutation """
+  mutation SymphonyLinearBlockedIssueState($issueId: String!, $stateId: String!) {
+    issueUpdate(id: $issueId, input: {stateId: $stateId}) {
+      success
+      issue { id identifier state { name } }
+    }
+  }
+  """
+
+  @blocked_report_start "<!-- symphony:block-report:start -->"
+  @blocked_report_end "<!-- symphony:block-report:end -->"
+
   @spec fetch_issues_by_states([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issues_by_states(state_names) when is_list(state_names) do
     normalized_states = Enum.map(state_names, &to_string/1) |> Enum.uniq()
@@ -165,6 +216,22 @@ defmodule SymphonyElixir.Linear.Client do
     end
   end
 
+  @spec report_blocked_issue(Issue.t(), map()) :: {:ok, Issue.t()} | {:error, term()}
+  def report_blocked_issue(%Issue{} = issue, report) when is_map(report) do
+    do_report_blocked_issue(issue, report, &graphql/2)
+  end
+
+  @doc false
+  @spec report_blocked_issue_for_test(
+          Issue.t(),
+          map(),
+          (String.t(), map() -> {:ok, map()} | {:error, term()})
+        ) :: {:ok, Issue.t()} | {:error, term()}
+  def report_blocked_issue_for_test(%Issue{} = issue, report, graphql_fun)
+      when is_map(report) and is_function(graphql_fun, 2) do
+    do_report_blocked_issue(issue, report, graphql_fun)
+  end
+
   @doc false
   @spec normalize_issue_for_test(map()) :: Issue.t() | nil
   def normalize_issue_for_test(issue) when is_map(issue) do
@@ -220,6 +287,230 @@ defmodule SymphonyElixir.Linear.Client do
   defp do_fetch_by_states(project_slug, state_names, assignee_filter) do
     do_fetch_by_states_page(project_slug, state_names, assignee_filter, nil, [])
   end
+
+  defp do_report_blocked_issue(%Issue{} = issue, report, graphql_fun) do
+    target_state = Map.get(report, :target_state)
+
+    with :ok <- validate_blocked_report(issue, target_state),
+         {:ok, context_body} <-
+           graphql_fun.(@blocked_report_context_query, %{
+             issueId: issue.id,
+             targetState: target_state
+           }),
+         {:ok, context} <- decode_blocked_report_context(context_body, target_state),
+         :ok <- upsert_blocked_workpad(issue, report, context, graphql_fun) do
+      transition_blocked_issue(issue, target_state, context, graphql_fun)
+    end
+  end
+
+  defp validate_blocked_report(%Issue{id: issue_id}, target_state) do
+    cond do
+      not present_string?(issue_id) -> {:error, :linear_blocked_report_missing_issue_id}
+      not present_string?(target_state) -> {:error, :missing_tracker_waiting_state}
+      true -> :ok
+    end
+  end
+
+  defp decode_blocked_report_context(
+         %{
+           "data" => %{
+             "issue" => %{
+               "id" => issue_id,
+               "team" => %{"id" => team_id},
+               "state" => %{"name" => current_state},
+               "comments" => %{"nodes" => comments}
+             },
+             "workflowStates" => %{"nodes" => states}
+           }
+         },
+         target_state
+       )
+       when is_binary(issue_id) and is_binary(team_id) and is_binary(current_state) and
+              is_list(comments) and is_list(states) do
+    case find_matching_workflow_state(states, team_id, target_state) do
+      %{"id" => state_id} ->
+        {:ok,
+         %{
+           current_state: current_state,
+           target_state_id: state_id,
+           comments: comments
+         }}
+
+      nil ->
+        {:error, {:linear_missing_blocked_report_state, target_state}}
+    end
+  end
+
+  defp decode_blocked_report_context(%{"errors" => errors}, _target_state) when is_list(errors) do
+    {:error, {:linear_graphql_errors, errors}}
+  end
+
+  defp decode_blocked_report_context(_body, _target_state), do: {:error, :linear_unknown_payload}
+
+  defp find_matching_workflow_state(states, team_id, target_state) do
+    Enum.find(states, &workflow_state_matches?(&1, team_id, target_state))
+  end
+
+  defp workflow_state_matches?(
+         %{"id" => state_id, "name" => state_name, "team" => %{"id" => state_team_id}},
+         team_id,
+         target_state
+       )
+       when is_binary(state_id) and is_binary(state_name) and is_binary(state_team_id) do
+    state_team_id == team_id and normalize_state_name(state_name) == normalize_state_name(target_state)
+  end
+
+  defp workflow_state_matches?(_state, _team_id, _target_state), do: false
+
+  defp upsert_blocked_workpad(%Issue{} = issue, report, context, graphql_fun) do
+    section = blocked_report_section(issue, report)
+
+    case find_workpad_comment(context.comments) do
+      %{"id" => comment_id, "body" => body} when is_binary(comment_id) and is_binary(body) ->
+        updated_body = replace_or_append_blocked_report(body, section)
+
+        graphql_fun.(@blocked_comment_update_mutation, %{
+          commentId: comment_id,
+          body: updated_body
+        })
+        |> decode_comment_mutation("commentUpdate")
+
+      _ ->
+        body = "## Codex 工作台\n\n" <> section <> "\n"
+
+        graphql_fun.(@blocked_comment_create_mutation, %{
+          issueId: issue.id,
+          body: body
+        })
+        |> decode_comment_mutation("commentCreate")
+    end
+  end
+
+  defp find_workpad_comment(comments) when is_list(comments) do
+    Enum.find(comments, fn
+      %{"body" => body} when is_binary(body) ->
+        Regex.match?(~r/^## Codex (工作台|Workpad)\s*$/m, body)
+
+      _ ->
+        false
+    end)
+  end
+
+  defp decode_comment_mutation({:ok, %{"data" => data}}, operation) when is_map(data) do
+    case Map.get(data, operation) do
+      %{"success" => true, "comment" => %{"id" => id}} when is_binary(id) ->
+        :ok
+
+      _ ->
+        {:error, :linear_unknown_payload}
+    end
+  end
+
+  defp decode_comment_mutation({:ok, %{"errors" => errors}}, _operation) when is_list(errors) do
+    {:error, {:linear_graphql_errors, errors}}
+  end
+
+  defp decode_comment_mutation({:ok, _body}, _operation), do: {:error, :linear_unknown_payload}
+  defp decode_comment_mutation({:error, reason}, _operation), do: {:error, reason}
+
+  defp transition_blocked_issue(%Issue{} = issue, target_state, context, graphql_fun) do
+    if normalize_state_name(context.current_state) == normalize_state_name(target_state) do
+      {:ok, %{issue | state: target_state, updated_at: DateTime.utc_now()}}
+    else
+      graphql_fun.(@blocked_issue_state_mutation, %{
+        issueId: issue.id,
+        stateId: context.target_state_id
+      })
+      |> decode_issue_state_mutation(issue, target_state)
+    end
+  end
+
+  defp decode_issue_state_mutation(
+         {:ok,
+          %{
+            "data" => %{
+              "issueUpdate" => %{
+                "success" => true,
+                "issue" => %{"id" => issue_id, "state" => %{"name" => state_name}}
+              }
+            }
+          }},
+         %Issue{id: issue_id} = issue,
+         target_state
+       )
+       when is_binary(state_name) do
+    if normalize_state_name(state_name) == normalize_state_name(target_state) do
+      {:ok, %{issue | state: state_name, updated_at: DateTime.utc_now()}}
+    else
+      {:error, {:linear_blocked_report_state_mismatch, state_name}}
+    end
+  end
+
+  defp decode_issue_state_mutation({:ok, %{"errors" => errors}}, _issue, _target_state)
+       when is_list(errors) do
+    {:error, {:linear_graphql_errors, errors}}
+  end
+
+  defp decode_issue_state_mutation({:ok, _body}, _issue, _target_state),
+    do: {:error, :linear_unknown_payload}
+
+  defp decode_issue_state_mutation({:error, reason}, _issue, _target_state), do: {:error, reason}
+
+  defp blocked_report_section(%Issue{} = issue, report) do
+    error = Map.get(report, :typed_error) || %{}
+    approval = Map.get(report, :approval) || %{}
+
+    [
+      @blocked_report_start,
+      "## Symphony 运行阻塞",
+      "",
+      "- Issue: `#{safe_inline(issue.identifier || issue.id)}`",
+      "- 状态: `blocked`",
+      "- 目标 Linear 状态: `#{safe_inline(Map.get(report, :target_state))}`",
+      "- Backend: `#{safe_inline(Map.get(report, :backend))}`",
+      "- Error: `#{safe_inline(Map.get(error, :kind))} / #{safe_inline(Map.get(error, :code))}`",
+      "- Message: #{safe_inline(Map.get(report, :message))}",
+      "- Approval: `#{safe_inline(Map.get(approval, :kind))} / #{safe_inline(Map.get(approval, :status))}`",
+      "- Session: `#{safe_inline(Map.get(report, :session_id))}`",
+      "- Workspace: `#{safe_inline(Map.get(report, :workspace_path))}`",
+      "- Blocked at: `#{safe_inline(format_datetime(Map.get(report, :blocked_at)))}`",
+      "- 处理: Symphony 已停止自动重试，等待人工处理；未记录原始 prompt、tool input 或凭据。",
+      @blocked_report_end
+    ]
+    |> Enum.join("\n")
+  end
+
+  defp replace_or_append_blocked_report(body, section) do
+    pattern =
+      Regex.compile!(
+        Regex.escape(@blocked_report_start) <> ".*?" <> Regex.escape(@blocked_report_end),
+        "s"
+      )
+
+    if Regex.match?(pattern, body) do
+      Regex.replace(pattern, body, section)
+    else
+      String.trim_trailing(body) <> "\n\n" <> section <> "\n"
+    end
+  end
+
+  defp safe_inline(nil), do: "n/a"
+
+  defp safe_inline(value) do
+    value
+    |> to_string()
+    |> String.replace(["\r", "\n", "`"], " ")
+    |> String.replace(~r/\s+/, " ")
+    |> String.trim()
+    |> String.slice(0, 500)
+    |> case do
+      "" -> "n/a"
+      text -> text
+    end
+  end
+
+  defp format_datetime(%DateTime{} = datetime), do: DateTime.to_iso8601(datetime)
+  defp format_datetime(value), do: value
 
   defp do_fetch_by_states_page(project_slug, state_names, assignee_filter, after_cursor, acc_issues) do
     with {:ok, body} <-
