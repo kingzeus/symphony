@@ -272,9 +272,23 @@ defmodule SymphonyElixirWeb.Presenter do
       backend: Map.get(blocked, :backend, :codex),
       last_event: Map.get(blocked, :last_agent_event) || blocked.last_codex_event,
       last_message: summarize_message(Map.get(blocked, :last_agent_message) || blocked.last_codex_message),
-      last_event_at: iso8601(Map.get(blocked, :last_agent_timestamp) || blocked.last_codex_timestamp)
+      last_event_at: iso8601(Map.get(blocked, :last_agent_timestamp) || blocked.last_codex_timestamp),
+      tracker_report: normalize_tracker_report(Map.get(blocked, :tracker_report))
     }
   end
+
+  defp normalize_tracker_report(nil), do: nil
+
+  defp normalize_tracker_report(report) when is_map(report) do
+    %{
+      status: Map.get(report, :status),
+      state: Map.get(report, :state),
+      error: Map.get(report, :error),
+      reported_at: iso8601(Map.get(report, :reported_at))
+    }
+  end
+
+  defp normalize_tracker_report(_report), do: nil
 
   defp waiting_issue_payload(waiting) do
     %{

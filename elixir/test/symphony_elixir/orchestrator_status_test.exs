@@ -1273,6 +1273,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     }
 
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [running_entry.issue])
+    Application.put_env(:symphony_elixir, :memory_tracker_report_recipient, self())
 
     :sys.replace_state(pid, fn _ ->
       initial_state
@@ -1281,31 +1282,35 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     end)
 
     send(pid, :tick)
-    Process.sleep(100)
+
+    snapshot =
+      wait_for_snapshot(
+        pid,
+        fn
+          %{blocked: [], waiting: [%{identifier: "MT-MCP"}]} -> true
+          _ -> false
+        end,
+        1_000
+      )
+
     state = :sys.get_state(pid)
 
     refute Process.alive?(worker_pid)
     refute Map.has_key?(state.running, issue_id)
     refute Map.has_key?(state.retry_attempts, issue_id)
-    assert MapSet.member?(state.claimed, issue_id)
+    refute MapSet.member?(state.claimed, issue_id)
+    refute Map.has_key?(state.blocked, issue_id)
 
     assert %{
-             identifier: "MT-MCP",
-             error: "codex MCP elicitation requires operator input",
-             worker_host: "dm-dev2",
-             workspace_path: "/workspaces/MT-MCP"
-           } = state.blocked[issue_id]
-
-    assert %{
-             blocked: [
+             blocked: [],
+             waiting: [
                %{
                  identifier: "MT-MCP",
                  issue_url: "https://example.org/issues/MT-MCP",
-                 error: "codex MCP elicitation requires operator input"
+                 state: "Human Review"
                }
              ]
-           } =
-             Orchestrator.snapshot(orchestrator_name, 1_000)
+           } = snapshot
   end
 
   test "orchestrator blocks failed workers after app-server reports input required" do
@@ -1342,6 +1347,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     }
 
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [running_entry.issue])
+    Application.put_env(:symphony_elixir, :memory_tracker_report_recipient, self())
 
     :sys.replace_state(pid, fn _ ->
       initial_state
@@ -1350,17 +1356,25 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     end)
 
     send(pid, {:DOWN, ref, :process, self(), {:shutdown, :input_required}})
-    Process.sleep(50)
+    assert_receive {:memory_tracker_blocked_report, %Issue{id: ^issue_id}, report}, 1_000
+    assert report.target_state == "Human Review"
+    assert report.message == "codex turn requires operator input"
+
+    wait_for_snapshot(
+      pid,
+      fn
+        %{blocked: [], waiting: [%{identifier: "MT-INPUT"}]} -> true
+        _ -> false
+      end,
+      1_000
+    )
+
     state = :sys.get_state(pid)
 
     refute Map.has_key?(state.running, issue_id)
     refute Map.has_key?(state.retry_attempts, issue_id)
-    assert MapSet.member?(state.claimed, issue_id)
-
-    assert %{
-             identifier: "MT-INPUT",
-             error: "codex turn requires operator input"
-           } = state.blocked[issue_id]
+    refute MapSet.member?(state.claimed, issue_id)
+    refute Map.has_key?(state.blocked, issue_id)
   end
 
   test "orchestrator blocks normal worker exits after input required completion" do
@@ -1398,6 +1412,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     }
 
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [running_entry.issue])
+    Application.put_env(:symphony_elixir, :memory_tracker_report_recipient, self())
 
     :sys.replace_state(pid, fn _ ->
       initial_state
@@ -1406,18 +1421,26 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     end)
 
     send(pid, {:DOWN, ref, :process, self(), :normal})
-    Process.sleep(50)
+    assert_receive {:memory_tracker_blocked_report, %Issue{id: ^issue_id}, report}, 1_000
+    assert report.target_state == "Human Review"
+    assert report.message == "codex turn requires operator input"
+
+    wait_for_snapshot(
+      pid,
+      fn
+        %{blocked: [], waiting: [%{identifier: "MT-INPUT-NORMAL"}]} -> true
+        _ -> false
+      end,
+      1_000
+    )
+
     state = :sys.get_state(pid)
 
     refute Map.has_key?(state.running, issue_id)
     refute Map.has_key?(state.retry_attempts, issue_id)
     refute MapSet.member?(state.completed, issue_id)
-    assert MapSet.member?(state.claimed, issue_id)
-
-    assert %{
-             identifier: "MT-INPUT-NORMAL",
-             error: "codex turn requires operator input"
-           } = state.blocked[issue_id]
+    refute MapSet.member?(state.claimed, issue_id)
+    refute Map.has_key?(state.blocked, issue_id)
   end
 
   test "status dashboard renders offline marker to terminal" do

@@ -89,8 +89,9 @@ defmodule SymphonyElixir.AgentEventOrchestratorTest do
     refute inspect(raw_events) =~ "__struct__"
   end
 
-  test "typed approval/input error 让 worker exit 进入 blocked，不依赖 Codex method 字符串" do
+  test "typed approval/input error 持久回写 waiting state 且不进入 retry" do
     {pid, _name, issue_id, ref} = start_orchestrator_with_running_issue(:AgentBlocked)
+    Application.put_env(:symphony_elixir, :memory_tracker_report_recipient, self())
 
     error =
       Error.new(:approval_required, "Claude Code requires tool approval",
@@ -112,9 +113,15 @@ defmodule SymphonyElixir.AgentEventOrchestratorTest do
 
     refute Map.has_key?(state.running, issue_id)
     refute Map.has_key?(state.retry_attempts, issue_id)
-    assert state.blocked[issue_id].error == "Claude Code requires tool approval"
-    assert state.blocked[issue_id].last_agent_error == error
-    assert state.blocked[issue_id].last_agent_approval == approval
+
+    assert_receive {:memory_tracker_blocked_report, %Issue{id: ^issue_id}, report}
+    assert report.target_state == "Human Review"
+    assert report.message == "Claude Code requires tool approval"
+    assert report.typed_error == error
+    assert report.approval == approval
+
+    assert [%Issue{id: ^issue_id, state: "Human Review"}] =
+             Application.get_env(:symphony_elixir, :memory_tracker_issues)
   end
 
   test "typed transient provider error 进入 retry" do

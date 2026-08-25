@@ -1124,29 +1124,31 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp block_issue_from_entry(%State{} = state, issue_id, running_entry, error) do
-    blocked_entry = %{
-      issue_id: issue_id,
-      identifier: Map.get(running_entry, :identifier, issue_id),
-      issue: Map.get(running_entry, :issue),
-      worker_host: Map.get(running_entry, :worker_host),
-      workspace_path: Map.get(running_entry, :workspace_path),
-      session_id: running_entry_session_id(running_entry),
-      error: error,
-      blocked_at: DateTime.utc_now(),
-      backend: Map.get(running_entry, :backend, :codex),
-      last_agent_message: Map.get(running_entry, :last_agent_message),
-      last_agent_event: Map.get(running_entry, :last_agent_event),
-      last_agent_timestamp: Map.get(running_entry, :last_agent_timestamp),
-      last_agent_error: Map.get(running_entry, :last_agent_error),
-      last_agent_approval: Map.get(running_entry, :last_agent_approval),
-      agent_updates: Map.get(running_entry, :agent_updates, []),
-      raw_agent_updates: Map.get(running_entry, :raw_agent_updates, []),
-      last_codex_message: Map.get(running_entry, :last_codex_message),
-      last_codex_event: Map.get(running_entry, :last_codex_event),
-      last_codex_timestamp: Map.get(running_entry, :last_codex_timestamp),
-      codex_updates: Map.get(running_entry, :codex_updates, []),
-      raw_codex_updates: Map.get(running_entry, :raw_codex_updates, [])
-    }
+    blocked_entry =
+      %{
+        issue_id: issue_id,
+        identifier: Map.get(running_entry, :identifier, issue_id),
+        issue: Map.get(running_entry, :issue),
+        worker_host: Map.get(running_entry, :worker_host),
+        workspace_path: Map.get(running_entry, :workspace_path),
+        session_id: running_entry_session_id(running_entry),
+        error: error,
+        blocked_at: DateTime.utc_now(),
+        backend: Map.get(running_entry, :backend, :codex),
+        last_agent_message: Map.get(running_entry, :last_agent_message),
+        last_agent_event: Map.get(running_entry, :last_agent_event),
+        last_agent_timestamp: Map.get(running_entry, :last_agent_timestamp),
+        last_agent_error: Map.get(running_entry, :last_agent_error),
+        last_agent_approval: Map.get(running_entry, :last_agent_approval),
+        agent_updates: Map.get(running_entry, :agent_updates, []),
+        raw_agent_updates: Map.get(running_entry, :raw_agent_updates, []),
+        last_codex_message: Map.get(running_entry, :last_codex_message),
+        last_codex_event: Map.get(running_entry, :last_codex_event),
+        last_codex_timestamp: Map.get(running_entry, :last_codex_timestamp),
+        codex_updates: Map.get(running_entry, :codex_updates, []),
+        raw_codex_updates: Map.get(running_entry, :raw_codex_updates, [])
+      }
+      |> report_blocked_issue_to_tracker()
 
     %{
       state
@@ -1156,6 +1158,90 @@ defmodule SymphonyElixir.Orchestrator do
         blocked: Map.put(state.blocked, issue_id, blocked_entry),
         backlog: Map.delete(state.backlog, issue_id)
     }
+  end
+
+  defp report_blocked_issue_to_tracker(%{issue: %Issue{} = issue} = blocked_entry) do
+    case blocked_report_target_state() do
+      nil ->
+        Map.put(blocked_entry, :tracker_report, %{
+          status: :skipped,
+          error: "tracker.waiting_states is empty"
+        })
+
+      target_state ->
+        report = %{
+          target_state: target_state,
+          message: Map.get(blocked_entry, :error),
+          backend: Map.get(blocked_entry, :backend, :codex),
+          session_id: Map.get(blocked_entry, :session_id),
+          workspace_path: Map.get(blocked_entry, :workspace_path),
+          blocked_at: Map.get(blocked_entry, :blocked_at),
+          typed_error: Map.get(blocked_entry, :last_agent_error),
+          approval: Map.get(blocked_entry, :last_agent_approval)
+        }
+
+        blocked_entry
+        |> apply_blocked_tracker_report(issue, target_state, safely_report_blocked_issue(issue, report))
+    end
+  end
+
+  defp report_blocked_issue_to_tracker(blocked_entry) do
+    Map.put(blocked_entry, :tracker_report, %{
+      status: :skipped,
+      error: "blocked entry has no tracker issue"
+    })
+  end
+
+  defp apply_blocked_tracker_report(blocked_entry, issue, target_state, {:ok, %Issue{} = updated_issue}) do
+    Logger.info("Blocked issue reported to tracker: #{issue_context(issue)} session_id=#{Map.get(blocked_entry, :session_id)} state=#{target_state}")
+
+    blocked_entry
+    |> Map.put(:issue, updated_issue)
+    |> Map.put(:tracker_report, %{
+      status: :reported,
+      state: updated_issue.state,
+      reported_at: DateTime.utc_now()
+    })
+  end
+
+  defp apply_blocked_tracker_report(blocked_entry, issue, target_state, :unsupported) do
+    Logger.debug("Blocked issue tracker reporting unsupported: #{issue_context(issue)} session_id=#{Map.get(blocked_entry, :session_id)} state=#{target_state}")
+
+    Map.put(blocked_entry, :tracker_report, %{status: :unsupported, state: target_state})
+  end
+
+  defp apply_blocked_tracker_report(blocked_entry, issue, target_state, {:error, reason}) do
+    error = inspect(reason, limit: 20, printable_limit: 1_000)
+
+    Logger.error("Failed to report blocked issue to tracker: #{issue_context(issue)} session_id=#{Map.get(blocked_entry, :session_id)} state=#{target_state} reason=#{error}")
+
+    Map.put(blocked_entry, :tracker_report, %{
+      status: :failed,
+      state: target_state,
+      error: error
+    })
+  end
+
+  defp safely_report_blocked_issue(issue, report) do
+    Tracker.report_blocked_issue(issue, report)
+  rescue
+    exception -> {:error, {:blocked_report_exception, Exception.message(exception)}}
+  catch
+    kind, reason -> {:error, {:blocked_report_termination, kind, reason}}
+  end
+
+  defp blocked_report_target_state do
+    Config.settings!().tracker.waiting_states
+    |> Enum.find_value(fn
+      state when is_binary(state) ->
+        case String.trim(state) do
+          "" -> nil
+          normalized -> normalized
+        end
+
+      _ ->
+        nil
+    end)
   end
 
   defp choose_issues(issues, state) do
@@ -2095,7 +2181,8 @@ defmodule SymphonyElixir.Orchestrator do
         last_codex_message: Map.get(metadata, :last_codex_message),
         last_codex_event: Map.get(metadata, :last_codex_event),
         codex_updates: Map.get(metadata, :codex_updates, []),
-        raw_codex_updates: Map.get(metadata, :raw_codex_updates, [])
+        raw_codex_updates: Map.get(metadata, :raw_codex_updates, []),
+        tracker_report: Map.get(metadata, :tracker_report)
       }
     end)
   end
