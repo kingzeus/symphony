@@ -380,11 +380,23 @@ defmodule SymphonyElixirWeb.Presenter do
       timestamp ->
         [
           %{
+            backend: Map.get(entry, :backend),
+            type: Map.get(entry, :last_agent_event) || Map.get(entry, :last_codex_event),
             event: Map.get(entry, :last_codex_event),
-            message: Map.get(entry, :last_codex_message),
+            message: last_codex_update_message(entry),
             timestamp: timestamp
           }
         ]
+    end
+  end
+
+  defp last_codex_update_message(entry) do
+    message = Map.get(entry, :last_agent_message) || Map.get(entry, :last_codex_message)
+
+    if is_map(message) and Map.get(message, :backend) == :claude_code do
+      Map.get(message, :message, message)
+    else
+      message
     end
   end
 
@@ -400,6 +412,8 @@ defmodule SymphonyElixirWeb.Presenter do
 
   defp normalize_codex_update(update) when is_map(update) do
     %{
+      backend: Map.get(update, :backend) || Map.get(update, "backend"),
+      type: Map.get(update, :type) || Map.get(update, "type"),
       event: Map.get(update, :event) || Map.get(update, "event"),
       message: Map.get(update, :message) || Map.get(update, "message"),
       timestamp: Map.get(update, :timestamp) || Map.get(update, "timestamp"),
@@ -408,7 +422,7 @@ defmodule SymphonyElixirWeb.Presenter do
   end
 
   defp normalize_codex_update(update) do
-    %{event: nil, message: update, timestamp: nil, display_message: nil}
+    %{backend: nil, type: nil, event: nil, message: update, timestamp: nil, display_message: nil}
   end
 
   defp execution_payload(entry, recent_events) do

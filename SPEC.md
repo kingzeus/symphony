@@ -1323,7 +1323,20 @@ Prompt and process safety:
 - The child shell SHOULD create a mode-`0600` temporary prompt file and remove it on normal exit,
   signals, and failures.
 - Declared tracker secret environment variables MUST be removed from the local or remote child
-  environment before Claude starts.
+  environment before Claude starts. Claude Code nesting markers (currently `CLAUDECODE` and
+  `CLAUDE_CODE_ENTRYPOINT`) MUST also be removed from the child environment before Claude starts,
+  on both local and SSH workers, so a Symphony run launched from inside another Claude Code session
+  does not inherit nested-mode restrictions.
+- Child stderr MUST NOT be merged into the `stream-json` protocol stream. It SHOULD be captured to a
+  mode-`0600` temporary file (inside the local mode-`0700` turn directory; remote workers use
+  `mktemp`-style temporary files) and removed on every convergence path: success, failure, timeout,
+  and cancellation. After convergence the host MAY read the captured stderr — locally before host
+  cleanup, remotely as a single best-effort read-and-remove command outside the remote launch
+  `EXIT` trap — and log only a sanitized diagnostic of at most 2048 bytes (control characters
+  scrubbed, obvious credential assignments masked, with a truncation marker). Empty diagnostics MUST
+  NOT be logged, and remote read failures degrade to no diagnostic. Raw stderr, prompts, tool
+  inputs, MCP configuration, tokens, and tracker secrets MUST NOT be written to the Workpad, state
+  API, or dashboard.
 - When the local HTTP server is enabled and the selected adapter advertises issue-scoped tools, Symphony MAY
   merge a `symphony_tracker` HTTP MCP server into null/object/inline-object `mcp_config`. Its bearer
   token MUST be mode-`0600` temporary-config material, MUST identify one issue/session/turn without
@@ -1667,6 +1680,13 @@ If implemented:
 
 - Treat them as observability-only output.
 - Do not make orchestrator logic depend on humanized strings.
+- Dispatch on the normalized event `backend` field (`codex | claude_code`); do not infer the
+  backend from payload shapes.
+- Claude Code summaries SHOULD be limited to the event type, tool names, turn outcome details
+  (result subtype, exit status, silence timeout, failure reason), the session identifier on session
+  startup, and provider-reported usage counts (input/output and cache read/creation counters when
+  reported). They MUST NOT include tool arguments, raw protocol frames, prompts, MCP configuration,
+  tokens, or tracker secrets.
 
 ### 13.7 OPTIONAL HTTP Server Extension
 
@@ -1982,6 +2002,10 @@ RECOMMENDED additional hardening for ports:
   credential.
 - Do not pass tracker credentials through the coding-agent child environment. Adapters MUST declare
   secret environment names so local and remote launchers can remove them from child environments.
+- Diagnostic stderr summaries from coding-agent child processes MUST only be written to host logs,
+  and MUST be sanitized and byte-capped before logging. Raw stderr, prompts, tool inputs, MCP
+  configuration, tokens, and tracker secrets MUST NOT be written to the Workpad, state API, or
+  dashboard.
 - Do not place literal tracker credentials in a repo-owned `WORKFLOW.md` when the child can read
   that workspace; use host-side secret references instead.
 

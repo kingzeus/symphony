@@ -156,9 +156,10 @@ defmodule SymphonyElixir.ClaudeCodeBackendTest do
     assert File.read!(trace <> ".mode") |> String.trim() == "600"
     prompt_path = File.read!(trace <> ".prompt_path") |> String.trim()
     stderr_path = File.read!(trace <> ".stderr_path") |> String.trim()
-    assert stderr_path == "/dev/null"
+    assert stderr_path != "/dev/null"
+    assert File.read!(trace <> ".stderr_mode") |> String.trim() == "600"
     refute File.exists?(prompt_path)
-    assert File.exists?(stderr_path)
+    refute File.exists?(stderr_path)
   end
 
   test "Port 启动后子进程瞬时退出仍返回 typed error 且不泄漏临时目录", context do
@@ -577,6 +578,236 @@ defmodule SymphonyElixir.ClaudeCodeBackendTest do
              ClaudeCodeBackend.run_turn(session, "stderr", context.issue)
   end
 
+  test "父环境含嵌套标记时 CLI 不受阻塞且子进程不继承标记", context do
+    trace = Path.join(context.test_root, "nested-marker.trace")
+    previous_claudecode = System.get_env("CLAUDECODE")
+    previous_entrypoint = System.get_env("CLAUDE_CODE_ENTRYPOINT")
+    System.put_env("CLAUDECODE", "1")
+    System.put_env("CLAUDE_CODE_ENTRYPOINT", "cli")
+
+    on_exit(fn ->
+      restore_env("CLAUDECODE", previous_claudecode)
+      restore_env("CLAUDE_CODE_ENTRYPOINT", previous_entrypoint)
+    end)
+
+    fake =
+      install_fake_claude!(
+        context.test_root,
+        """
+        #!/bin/sh
+        printf 'CLAUDECODE:%s\n' "${CLAUDECODE:-unset}" > #{shell_literal(trace)}
+        printf 'CLAUDE_CODE_ENTRYPOINT:%s\n' "${CLAUDE_CODE_ENTRYPOINT:-unset}" >> #{shell_literal(trace)}
+        cat >/dev/null
+        printf '%s\n' '{"type":"result","session_id":"#{@provider_session_1}","usage":{"input_tokens":1,"output_tokens":1}}'
+        """,
+        "nested-marker"
+      )
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: context.workspace_root,
+      agent_backend: "claude_code",
+      claude_code_command: fake
+    )
+
+    {:ok, session} = ClaudeCodeBackend.start_session(context.workspace)
+    assert {:ok, result} = ClaudeCodeBackend.run_turn(session, "nested", context.issue)
+    assert result.session.session_id == @provider_session_1
+
+    trace_text = File.read!(trace)
+    assert trace_text =~ "CLAUDECODE:unset"
+    assert trace_text =~ "CLAUDE_CODE_ENTRYPOINT:unset"
+  end
+
+  test "stderr 诊断写入宿主日志前脱敏限长，空内容不记录", context do
+    secret = String.duplicate("好", 800)
+    noisy_line = "\e[31mstartup failed\e[0m API_KEY=super-secret-value noise #{secret}\n\n\n"
+
+    fake =
+      install_fake_claude!(
+        context.test_root,
+        """
+        #!/bin/sh
+        cat >/dev/null
+        printf '%s' #{shell_literal(noisy_line)} >&2
+        printf '%s\n' '{"type":"result","session_id":"#{@provider_session_1}","usage":{"input_tokens":1,"output_tokens":1}}'
+        """,
+        "stderr-diagnostic"
+      )
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: context.workspace_root,
+      agent_backend: "claude_code",
+      claude_code_command: fake
+    )
+
+    {:ok, session} = ClaudeCodeBackend.start_session(context.workspace)
+
+    log =
+      capture_log([level: :warning], fn ->
+        assert {:ok, _result} = ClaudeCodeBackend.run_turn(session, "diagnostic", context.issue)
+      end)
+
+    assert log =~ "Claude Code stderr diagnostic (local"
+    assert log =~ "startup failed API_KEY=<redacted> noise"
+    refute log =~ "super-secret-value"
+    refute log =~ "\e[31m"
+    assert log =~ "...[truncated]"
+    assert String.valid?(log)
+
+    diagnostic_line =
+      log
+      |> String.split("\n", trim: true)
+      |> Enum.find(&String.contains?(&1, "stderr diagnostic"))
+
+    assert String.length(diagnostic_line) < 2_500
+
+    silent =
+      install_fake_claude!(
+        context.test_root,
+        """
+        #!/bin/sh
+        cat >/dev/null
+        printf '%s\n' '{"type":"result","session_id":"#{@provider_session_1}","usage":{"input_tokens":1,"output_tokens":1}}'
+        """,
+        "stderr-silent"
+      )
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: context.workspace_root,
+      agent_backend: "claude_code",
+      claude_code_command: silent
+    )
+
+    {:ok, silent_session} = ClaudeCodeBackend.start_session(context.workspace)
+
+    silent_log =
+      capture_log([level: :warning], fn ->
+        assert {:ok, _result} = ClaudeCodeBackend.run_turn(silent_session, "silent", context.issue)
+      end)
+
+    refute silent_log =~ "stderr diagnostic"
+
+    deleted =
+      install_fake_claude!(
+        context.test_root,
+        """
+        #!/bin/sh
+        cat >/dev/null
+        printf 'will disappear\n' >&2
+        rm -f -- "${SYMPHONY_CLAUDE_STDERR_FILE:-}"
+        printf '%s\n' '{"type":"result","session_id":"#{@provider_session_1}","usage":{"input_tokens":1,"output_tokens":1}}'
+        """,
+        "stderr-deleted"
+      )
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: context.workspace_root,
+      agent_backend: "claude_code",
+      claude_code_command: deleted
+    )
+
+    {:ok, deleted_session} = ClaudeCodeBackend.start_session(context.workspace)
+
+    deleted_log =
+      capture_log([level: :warning], fn ->
+        assert {:ok, _result} = ClaudeCodeBackend.run_turn(deleted_session, "deleted", context.issue)
+      end)
+
+    refute deleted_log =~ "stderr diagnostic"
+  end
+
+  test "超大 stderr 只限读头部并记录截断摘要，不扫描尾部", context do
+    fake =
+      install_fake_claude!(
+        context.test_root,
+        """
+        #!/bin/sh
+        cat >/dev/null
+        head -c 10485760 /dev/zero | tr '\\000' a >&2
+        printf '%s\n' 'TAIL-MARKER-END' >&2
+        printf '%s\n' '{"type":"result","session_id":"#{@provider_session_1}","usage":{"input_tokens":1,"output_tokens":1}}'
+        """,
+        "stderr-huge"
+      )
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: context.workspace_root,
+      agent_backend: "claude_code",
+      claude_code_command: fake
+    )
+
+    {:ok, session} = ClaudeCodeBackend.start_session(context.workspace)
+
+    log =
+      capture_log([level: :warning], fn ->
+        assert {:ok, _result} = ClaudeCodeBackend.run_turn(session, "huge stderr", context.issue)
+      end)
+
+    assert log =~ "Claude Code stderr diagnostic (local"
+    assert log =~ "...[truncated]"
+    refute log =~ "TAIL-MARKER-END"
+
+    diagnostic_line =
+      log
+      |> String.split("\n", trim: true)
+      |> Enum.find(&String.contains?(&1, "stderr diagnostic"))
+
+    assert byte_size(diagnostic_line) <= 2_500
+  end
+
+  test "SSH 收敛后远端诊断读取超时降级为无诊断且清理不阻塞", context do
+    previous_path = System.get_env("PATH")
+    fake_bin = Path.join(context.test_root, "slow-ssh-bin")
+    fake_ssh = Path.join(fake_bin, "ssh")
+    File.mkdir_p!(fake_bin)
+
+    File.write!(fake_ssh, """
+    #!/bin/sh
+    case "$*" in
+      *"; true"*) sleep 30; exit 1 ;;
+      *)
+        last=''
+        for arg in "$@"; do last="$arg"; done
+        eval "$last"
+        ;;
+    esac
+    """)
+
+    File.chmod!(fake_ssh, 0o755)
+    System.put_env("PATH", fake_bin <> ":" <> (previous_path || ""))
+    on_exit(fn -> restore_env("PATH", previous_path) end)
+
+    fake_claude =
+      install_fake_claude!(
+        context.test_root,
+        """
+        #!/bin/sh
+        cat >/dev/null
+        printf 'remote diagnostic\n' >&2
+        printf '%s\n' '{"type":"result","session_id":"#{@provider_session_1}","usage":{"input_tokens":1,"output_tokens":1}}'
+        """,
+        "slow-diagnostic"
+      )
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: context.workspace_root,
+      agent_backend: "claude_code",
+      claude_code_command: fake_claude
+    )
+
+    {:ok, session} = ClaudeCodeBackend.start_session(context.workspace, worker_host: "worker-a")
+
+    log =
+      capture_log([level: :warning], fn ->
+        started = System.monotonic_time(:millisecond)
+        assert {:ok, result} = ClaudeCodeBackend.run_turn(session, "slow diagnostic", context.issue)
+        assert result.session.session_id == @provider_session_1
+        assert System.monotonic_time(:millisecond) - started < 10_000
+      end)
+
+    refute log =~ "stderr diagnostic"
+  end
+
   test "success、provider failure、timeout 和 process exit 都清理 prompt/MCP/stderr 临时文件", context do
     cases = [
       {:success, ~s|printf '%s\n' '{"type":"result","session_id":"#{@provider_session_1}","usage":{"input_tokens":1,"output_tokens":1}}'|},
@@ -863,6 +1094,7 @@ defmodule SymphonyElixir.ClaudeCodeBackendTest do
         cat "$mcp_path" > #{shell_literal(trace <> ".mcp")}
         cat > #{shell_literal(trace <> ".prompt")}
         printf '%s\n%s\n%s\n' "${SYMPHONY_CLAUDE_PROMPT_FILE:-}" "$mcp_path" "${SYMPHONY_CLAUDE_STDERR_FILE:-}" > #{shell_literal(trace <> ".paths")}
+        printf 'remote stderr diagnostic\n' >&2
         exit 31
         """,
         "remote"
@@ -902,8 +1134,26 @@ defmodule SymphonyElixir.ClaudeCodeBackendTest do
 
     assert {:ok, session} = ClaudeCodeBackend.start_session(context.workspace, worker_host: "worker-a:2222")
 
-    assert {:error, %Error{kind: :process_exit, code: 31}} =
-             ClaudeCodeBackend.run_turn(session, "remote prompt", context.issue)
+    log =
+      capture_log([level: :warning], fn ->
+        assert {:error, %Error{kind: :process_exit, code: 31}} =
+                 ClaudeCodeBackend.run_turn(session, "remote prompt", context.issue)
+      end)
+
+    assert log =~ "Claude Code stderr diagnostic (worker-a:2222"
+    assert log =~ "remote stderr diagnostic"
+
+    ssh_args =
+      trace
+      |> File.read!()
+      |> String.split("\n", trim: true)
+      |> Enum.filter(&String.starts_with?(&1, "ARGV:"))
+
+    assert Enum.any?(ssh_args, fn line ->
+             line =~ "${TMPDIR:-/tmp}/symphony-claude-stderr-" and line =~ "/tmp/symphony-claude-stderr-" and
+               String.contains?(line, "cat") and String.contains?(line, "rm -f --")
+           end),
+           "expected one best-effort ssh call covering both TMPDIR and /tmp diagnostic globs: #{inspect(ssh_args)}"
 
     trace_text = File.read!(trace)
     assert trace_text =~ "-p 2222 worker-a"
@@ -1746,9 +1996,12 @@ defmodule SymphonyElixir.ClaudeCodeBackendTest do
     printf '\n' >> "$trace"
     cat > "$trace.prompt"
     prompt_path="${SYMPHONY_CLAUDE_PROMPT_FILE:-}"
+    stderr_path="${SYMPHONY_CLAUDE_STDERR_FILE:-}"
     printf '%s\n' "$prompt_path" > "$trace.prompt_path"
-    printf '%s\n' "${SYMPHONY_CLAUDE_STDERR_FILE:-}" > "$trace.stderr_path"
+    printf '%s\n' "$stderr_path" > "$trace.stderr_path"
     stat -f '%Lp' "$prompt_path" > "$trace.mode" 2>/dev/null || stat -c '%a' "$prompt_path" > "$trace.mode"
+    stat -f '%Lp' "$stderr_path" > "$trace.stderr_mode" 2>/dev/null || stat -c '%a' "$stderr_path" > "$trace.stderr_mode"
+    printf 'working stderr diagnostic\n' >&2
     printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"working"}]}}'
     printf '%s\n' '{"type":"result","subtype":"success","session_id":"#{@provider_session_1}","usage":{"input_tokens":12,"output_tokens":5,"cache_read_input_tokens":3,"cache_creation_input_tokens":2}}'
     """
@@ -1776,10 +2029,11 @@ defmodule SymphonyElixir.ClaudeCodeBackendTest do
     assert length(paths) == 3
     assert Enum.all?(paths, &(String.trim(&1) != ""))
 
-    temporary_paths = Enum.reject(paths, &(&1 == "/dev/null" or &1 == "unused"))
+    [_prompt_path, _mcp_path, stderr_path] = Enum.map(paths, &String.trim/1)
+    assert stderr_path != "/dev/null" and stderr_path != "unused"
 
-    assert wait_until(fn -> Enum.all?(temporary_paths, &(not File.exists?(&1))) end),
-           "#{label} temporary files leaked: #{inspect(Enum.filter(temporary_paths, &File.exists?/1))}"
+    assert wait_until(fn -> Enum.all?(paths, &(not File.exists?(&1))) end),
+           "#{label} temporary files leaked: #{inspect(Enum.filter(paths, &File.exists?/1))}"
   end
 
   defp os_process_alive?(pid) when is_integer(pid) do

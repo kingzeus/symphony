@@ -599,7 +599,7 @@ defmodule SymphonyElixir.StatusDashboard do
     turn_count = Map.get(running_entry, :turn_count, 0)
     age = format_cell(format_runtime_and_turns(runtime_seconds, turn_count), @running_age_width)
     event = running_entry.last_codex_event || "none"
-    event_label = format_cell(summarize_message(running_entry.last_codex_message), running_event_width)
+    event_label = format_cell(summarize_running_message(running_entry), running_event_width)
 
     tokens = format_count(total_tokens) |> format_cell(@running_tokens_width, :right)
 
@@ -1070,7 +1070,225 @@ defmodule SymphonyElixir.StatusDashboard do
 
   @doc false
   @spec humanize_agent_message(term()) :: String.t()
-  def humanize_agent_message(message), do: humanize_codex_message(message)
+  def humanize_agent_message(message) do
+    if claude_code_message?(message) do
+      humanize_claude_code_message(message)
+    else
+      humanize_codex_message(message)
+    end
+  end
+
+  defp claude_code_message?(message) when is_map(message) do
+    Map.get(message, :backend) == :claude_code or Map.get(message, "backend") == :claude_code
+  end
+
+  defp claude_code_message?(_message), do: false
+
+  defp humanize_claude_code_message(message) do
+    type = claude_code_update_type(message)
+    payload = claude_code_update_payload(message)
+
+    (humanize_claude_code_event(type, payload) || "claude code #{type || "event"}")
+    |> truncate(140)
+  end
+
+  defp claude_code_update_type(message) when is_map(message) do
+    Map.get(message, :type) || Map.get(message, "type") || Map.get(message, :event) || Map.get(message, "event")
+  end
+
+  defp claude_code_update_type(_message), do: nil
+
+  defp claude_code_update_payload(message) when is_map(message) do
+    Map.get(message, :message) || Map.get(message, "message") || message
+  end
+
+  defp claude_code_update_payload(message), do: message
+
+  defp humanize_claude_code_event(:session_started, payload) do
+    session_id = map_value(payload, ["session_id", :session_id])
+
+    if is_binary(session_id) do
+      "session started (#{session_id})"
+    else
+      "session started"
+    end
+  end
+
+  defp humanize_claude_code_event(:startup_failed, payload) do
+    "startup failed: #{claude_code_reason(payload)}"
+  end
+
+  defp humanize_claude_code_event(:turn_completed, payload) do
+    subtype = map_value(payload, ["subtype", :subtype])
+    usage_text = claude_usage_text(map_value(payload, ["usage", :usage]))
+
+    parts =
+      [subtype, usage_text]
+      |> Enum.filter(fn part -> is_binary(part) and part != "" end)
+
+    case parts do
+      [] -> "turn completed"
+      details -> "turn completed (" <> Enum.join(details, ", ") <> ")"
+    end
+  end
+
+  defp humanize_claude_code_event(:turn_failed, payload) do
+    "turn failed" <> claude_code_failure_suffix(payload)
+  end
+
+  defp humanize_claude_code_event(:turn_cancelled, payload) do
+    case claude_code_reason(payload) do
+      "" -> "turn cancelled"
+      reason -> "turn cancelled (#{reason})"
+    end
+  end
+
+  defp humanize_claude_code_event(:approval_required, payload) do
+    case claude_code_denied_tool_names(payload) do
+      [] -> "approval required: tool permission denied"
+      tool_names -> "approval required: #{Enum.join(tool_names, ", ")}"
+    end
+  end
+
+  defp humanize_claude_code_event(:tool_activity, payload) do
+    case claude_code_tool_names(payload) do
+      [] -> if claude_code_tool_result?(payload), do: "tool result", else: "tool activity"
+      tool_names -> "tool activity: #{Enum.join(tool_names, ", ")}"
+    end
+  end
+
+  defp humanize_claude_code_event(:notification, payload) do
+    case map_value(payload, ["type", :type]) do
+      "assistant" -> "assistant message"
+      "system" -> "system event" <> claude_code_subtype_suffix(payload)
+      _other -> "notification"
+    end
+  end
+
+  defp humanize_claude_code_event(:progress, _payload), do: "progress"
+  defp humanize_claude_code_event(:malformed_protocol, _payload), do: "malformed claude frame"
+  defp humanize_claude_code_event(_event, _payload), do: nil
+
+  defp claude_code_failure_suffix(payload) when is_map(payload) do
+    error_value = map_value(payload, ["error", :error])
+
+    cond do
+      error_value != nil ->
+        ": #{format_error_value(error_value)}"
+
+      is_integer(map_value(payload, ["exit_status", :exit_status])) ->
+        ": exit #{map_value(payload, ["exit_status", :exit_status])}"
+
+      is_integer(map_value(payload, ["timeout_ms", :timeout_ms])) ->
+        ": silent timeout #{map_value(payload, ["timeout_ms", :timeout_ms])}ms"
+
+      is_binary(map_value(payload, ["subtype", :subtype])) ->
+        ": #{map_value(payload, ["subtype", :subtype])}"
+
+      true ->
+        case claude_code_reason(payload) do
+          "" -> ""
+          reason -> ": #{reason}"
+        end
+    end
+  end
+
+  defp claude_code_failure_suffix(_payload), do: ""
+
+  defp claude_code_reason(payload) when is_map(payload) do
+    case map_value(payload, ["reason", :reason]) do
+      reason when is_binary(reason) -> reason
+      reason when is_atom(reason) and not is_nil(reason) and not is_boolean(reason) -> Atom.to_string(reason)
+      _other -> ""
+    end
+  end
+
+  defp claude_code_reason(_payload), do: ""
+
+  defp claude_code_subtype_suffix(payload) do
+    case map_value(payload, ["subtype", :subtype]) do
+      subtype when is_binary(subtype) and subtype != "" -> " (#{subtype})"
+      _other -> ""
+    end
+  end
+
+  defp claude_code_denied_tool_names(payload) when is_map(payload) do
+    case map_value(payload, ["permission_denials", :permission_denials]) do
+      denials when is_list(denials) ->
+        denials
+        |> Enum.map(&map_value(&1, ["tool_name", :tool_name]))
+        |> Enum.filter(&is_binary/1)
+        |> Enum.uniq()
+        |> Enum.take(3)
+
+      _other ->
+        []
+    end
+  end
+
+  defp claude_code_denied_tool_names(_payload), do: []
+
+  defp claude_code_tool_names(payload) when is_map(payload) do
+    direct_name = map_value(payload, ["name", :name])
+
+    names =
+      case map_path(payload, ["message", "content"]) || map_path(payload, [:message, :content]) do
+        content when is_list(content) ->
+          Enum.flat_map(content, fn
+            %{"type" => "tool_use", "name" => name} when is_binary(name) -> [name]
+            %{type: :tool_use, name: name} when is_binary(name) -> [name]
+            _entry -> []
+          end)
+
+        _other ->
+          []
+      end
+
+    names = if is_binary(direct_name), do: [direct_name | names], else: names
+    names |> Enum.uniq() |> Enum.take(5)
+  end
+
+  defp claude_code_tool_names(_payload), do: []
+
+  defp claude_code_tool_result?(payload) when is_map(payload) do
+    case map_path(payload, ["message", "content"]) || map_path(payload, [:message, :content]) do
+      content when is_list(content) ->
+        Enum.any?(content, fn
+          %{"type" => "tool_result"} -> true
+          %{type: :tool_result} -> true
+          _entry -> false
+        end)
+
+      _other ->
+        false
+    end
+  end
+
+  defp claude_code_tool_result?(_payload), do: false
+
+  defp claude_usage_text(usage) when is_map(usage) do
+    cache_read = parse_integer(map_value(usage, ["cache_read_input_tokens", :cache_read_input_tokens]))
+    cache_creation = parse_integer(map_value(usage, ["cache_creation_input_tokens", :cache_creation_input_tokens]))
+
+    case format_usage_counts(usage) do
+      nil ->
+        nil
+
+      usage_text ->
+        []
+        |> append_cache_usage_part("cache read", cache_read)
+        |> append_cache_usage_part("cache write", cache_creation)
+        |> case do
+          [] -> usage_text
+          cache_parts -> usage_text <> ", " <> Enum.join(cache_parts, ", ")
+        end
+    end
+  end
+
+  defp claude_usage_text(_usage), do: nil
+
+  defp append_cache_usage_part(parts, _label, value) when not is_integer(value) or value == 0, do: parts
+  defp append_cache_usage_part(parts, label, value), do: parts ++ ["#{label} #{format_count(value)}"]
 
   @spec humanize_codex_message(term()) :: String.t()
   def humanize_codex_message(nil), do: "no agent message yet"
@@ -1104,7 +1322,15 @@ defmodule SymphonyElixir.StatusDashboard do
     |> truncate(140)
   end
 
-  defp summarize_message(message), do: humanize_codex_message(message)
+  defp summarize_message(message), do: humanize_agent_message(message)
+
+  defp summarize_running_message(running_entry) when is_map(running_entry) do
+    summarize_message(
+      Map.get(running_entry, :last_agent_message) ||
+        Map.get(running_entry, "last_agent_message") ||
+        Map.get(running_entry, :last_codex_message)
+    )
+  end
 
   defp humanize_codex_event(:session_started, _message, payload) do
     session_id = map_value(payload, ["session_id", :session_id])

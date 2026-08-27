@@ -1,6 +1,8 @@
 defmodule SymphonyElixir.OrchestratorStatusTest do
   use SymphonyElixir.TestSupport
 
+  alias SymphonyElixir.AgentServer.Event
+
   test "snapshot returns :timeout when snapshot server is unresponsive" do
     server_name = Module.concat(__MODULE__, :UnresponsiveSnapshotServer)
     parent = self()
@@ -96,14 +98,16 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert snapshot_entry.last_codex_timestamp == now
 
     assert snapshot_entry.last_codex_message == %{
+             backend: :codex,
+             type: :notification,
              event: :notification,
              message: %{method: "some-event"},
              timestamp: now
            }
 
     assert snapshot_entry.codex_updates == [
-             %{event: :session_started, message: nil, timestamp: now},
-             %{event: :notification, message: %{method: "some-event"}, timestamp: now}
+             %{backend: :codex, type: :session_started, event: :session_started, message: nil, timestamp: now},
+             %{backend: :codex, type: :notification, event: :notification, message: %{method: "some-event"}, timestamp: now}
            ]
   end
 
@@ -1890,6 +1894,222 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
       assert humanized =~ expected_fragment
     end)
+  end
+
+  test "status dashboard humanizes claude_code events with typed backend dispatch" do
+    provider_session = "11111111-1111-4111-8111-111111111111"
+
+    session_started = %{
+      backend: :claude_code,
+      type: :session_started,
+      event: :session_started,
+      message: %{session_id: provider_session}
+    }
+
+    assert StatusDashboard.humanize_agent_message(session_started) == "session started (#{provider_session})"
+
+    assistant = %{
+      backend: :claude_code,
+      type: :notification,
+      event: :notification,
+      message: %{"type" => "assistant", "message" => %{"content" => [%{"type" => "text", "text" => "working"}]}}
+    }
+
+    assert StatusDashboard.humanize_agent_message(assistant) == "assistant message"
+
+    tool_activity = %{
+      backend: :claude_code,
+      type: :tool_activity,
+      event: :tool_activity,
+      message: %{"type" => "assistant", "message" => %{"content" => [%{"type" => "tool_use", "name" => "Read"}, %{"type" => "tool_use", "name" => "Bash"}]}}
+    }
+
+    assert StatusDashboard.humanize_agent_message(tool_activity) == "tool activity: Read, Bash"
+
+    tool_result = %{
+      backend: :claude_code,
+      type: :tool_activity,
+      event: :tool_activity,
+      message: %{"type" => "user", "message" => %{"content" => [%{"type" => "tool_result"}]}}
+    }
+
+    assert StatusDashboard.humanize_agent_message(tool_result) == "tool result"
+
+    turn_completed = %{
+      backend: :claude_code,
+      type: :turn_completed,
+      event: :turn_completed,
+      message: %{
+        "type" => "result",
+        "subtype" => "success",
+        "usage" => %{
+          "input_tokens" => 12,
+          "output_tokens" => 5,
+          "cache_read_input_tokens" => 3,
+          "cache_creation_input_tokens" => 2
+        }
+      }
+    }
+
+    assert StatusDashboard.humanize_agent_message(turn_completed) ==
+             "turn completed (success, in 12, out 5, cache read 3, cache write 2)"
+
+    turn_completed_no_cache = %{
+      backend: :claude_code,
+      type: :turn_completed,
+      event: :turn_completed,
+      message: %{"type" => "result", "subtype" => "success", "usage" => %{"input_tokens" => 12, "output_tokens" => 5}}
+    }
+
+    assert StatusDashboard.humanize_agent_message(turn_completed_no_cache) == "turn completed (success, in 12, out 5)"
+
+    turn_failed = %{
+      backend: :claude_code,
+      type: :turn_failed,
+      event: :turn_failed,
+      message: %{"error" => %{"message" => "provider overloaded"}}
+    }
+
+    assert StatusDashboard.humanize_agent_message(turn_failed) == "turn failed: provider overloaded"
+
+    exit_failed = %{
+      backend: :claude_code,
+      type: :turn_failed,
+      event: :turn_failed,
+      message: %{exit_status: 31}
+    }
+
+    assert StatusDashboard.humanize_agent_message(exit_failed) == "turn failed: exit 31"
+
+    approval_required = %{
+      backend: :claude_code,
+      type: :approval_required,
+      event: :approval_required,
+      message: %{"type" => "result", "permission_denials" => [%{"tool_name" => "Bash"}]}
+    }
+
+    assert StatusDashboard.humanize_agent_message(approval_required) == "approval required: Bash"
+
+    turn_cancelled = %{
+      backend: :claude_code,
+      type: :turn_cancelled,
+      event: :turn_cancelled,
+      message: %{reason: :orchestrator_stop}
+    }
+
+    assert StatusDashboard.humanize_agent_message(turn_cancelled) == "turn cancelled (orchestrator_stop)"
+
+    startup_failed = %{
+      backend: :claude_code,
+      type: :startup_failed,
+      event: :startup_failed,
+      message: %{reason: :bash_not_found}
+    }
+
+    assert StatusDashboard.humanize_agent_message(startup_failed) == "startup failed: bash_not_found"
+
+    malformed = %{backend: :claude_code, type: :malformed_protocol, event: :malformed_protocol, message: %{"raw" => "{not json"}}
+
+    assert StatusDashboard.humanize_agent_message(malformed) == "malformed claude frame"
+
+    progress = %{backend: :claude_code, type: :progress, event: :progress, message: %{"type" => "stream_event"}}
+
+    assert StatusDashboard.humanize_agent_message(progress) == "progress"
+
+    claude_frames = [
+      session_started,
+      assistant,
+      tool_activity,
+      tool_result,
+      turn_completed,
+      turn_failed,
+      exit_failed,
+      approval_required,
+      turn_cancelled,
+      startup_failed,
+      malformed,
+      progress
+    ]
+
+    rendered = Enum.map_join(claude_frames, "\n", &StatusDashboard.humanize_agent_message/1)
+    refute rendered =~ "working"
+    refute rendered =~ "tool_input"
+    refute rendered =~ "command"
+    refute rendered =~ "permission_denials"
+    refute rendered =~ "__struct__"
+    refute rendered =~ "%{"
+
+    legacy_codex = %{event: :notification, message: %{"method" => "turn/started", "params" => %{"turn" => %{"id" => "turn-1"}}}}
+    assert StatusDashboard.humanize_agent_message(legacy_codex) =~ "turn started"
+  end
+
+  test "orchestrator summaries keep typed backend/type fields for claude_code events" do
+    issue_id = "issue-claude-summary"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-CLAUDE",
+      title: "Claude summary test",
+      description: "Capture typed summaries",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-CLAUDE"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :ClaudeSummaryOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+    started_at = DateTime.utc_now()
+
+    running_entry = %{
+      pid: self(),
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: nil,
+      turn_count: 0,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      started_at: started_at
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    now = DateTime.utc_now()
+
+    send(
+      pid,
+      {:agent_worker_update, issue_id,
+       Event.new(:claude_code, :tool_activity,
+         timestamp: now,
+         payload: %{"type" => "assistant", "message" => %{"content" => [%{"type" => "tool_use", "name" => "Read"}]}}
+       )}
+    )
+
+    snapshot = GenServer.call(pid, :snapshot)
+    assert %{running: [snapshot_entry]} = snapshot
+
+    assert snapshot_entry.last_agent_message == %{
+             backend: :claude_code,
+             type: :tool_activity,
+             event: :tool_activity,
+             message: %{"type" => "assistant", "message" => %{"content" => [%{"type" => "tool_use", "name" => "Read"}]}},
+             timestamp: now
+           }
+
+    humanized = StatusDashboard.humanize_agent_message(snapshot_entry.last_agent_message)
+    assert humanized == "tool activity: Read"
   end
 
   test "status dashboard humanizes dynamic tool wrapper events" do

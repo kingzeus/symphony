@@ -596,6 +596,100 @@ defmodule SymphonyElixir.ExtensionsTest do
              ["The ", "answer", "Separate"]
   end
 
+  test "phoenix observability api renders typed claude_code summaries without tool inputs" do
+    tool_at = DateTime.add(DateTime.utc_now(), -1, :second)
+
+    tool_update = %{
+      backend: :claude_code,
+      type: :tool_activity,
+      event: :tool_activity,
+      message: %{
+        "type" => "assistant",
+        "message" => %{
+          "content" => [
+            %{"type" => "tool_use", "name" => "Read", "input" => %{"file_path" => "/secret/path.rb"}},
+            %{"type" => "tool_use", "name" => "Bash", "input" => %{"command" => "rm -rf scratch"}}
+          ]
+        }
+      },
+      timestamp: tool_at
+    }
+
+    base_entry =
+      static_snapshot()
+      |> Map.fetch!(:running)
+      |> List.first()
+
+    updates_entry =
+      base_entry
+      |> Map.put(:backend, :claude_code)
+      |> Map.put(:last_agent_event, :tool_activity)
+      |> Map.put(:last_agent_message, tool_update)
+      |> Map.put(:last_agent_timestamp, tool_at)
+      |> Map.put(:last_codex_timestamp, tool_at)
+      |> Map.put(:agent_updates, [tool_update])
+
+    fallback_at = DateTime.add(tool_at, 1, :second)
+
+    fallback_entry =
+      base_entry
+      |> Map.put(:issue_id, "issue-claude-fallback")
+      |> Map.put(:identifier, "MT-CLAUDE-FALLBACK")
+      |> Map.put(:backend, :claude_code)
+      |> Map.put(:last_agent_event, :notification)
+      |> Map.put(:last_agent_message, %{
+        backend: :claude_code,
+        type: :notification,
+        event: :notification,
+        message: %{"type" => "assistant", "message" => %{"content" => [%{"type" => "text", "text" => "working"}]}},
+        timestamp: fallback_at
+      })
+      |> Map.put(:last_agent_timestamp, fallback_at)
+      |> Map.put(:last_codex_event, :notification)
+      |> Map.put(:last_codex_timestamp, fallback_at)
+
+    orchestrator_name = Module.concat(__MODULE__, :ClaudeHumanizerOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: %{static_snapshot() | running: [updates_entry, fallback_entry]}
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    state_payload = json_response(get(build_conn(), "/api/v1/state"), 200)
+    [updates_payload, fallback_payload] = state_payload["running"]
+
+    assert updates_payload["last_message"] == "tool activity: Read, Bash"
+
+    assert updates_payload["recent_events"] == [
+             %{
+               "at" => tool_at |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+               "event" => "tool_activity",
+               "message" => "tool activity: Read, Bash"
+             }
+           ]
+
+    assert fallback_payload["last_message"] == "assistant message"
+
+    assert fallback_payload["recent_events"] == [
+             %{
+               "at" => fallback_at |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+               "event" => "notification",
+               "message" => "assistant message"
+             }
+           ]
+
+    rendered = Jason.encode!(state_payload)
+    refute rendered =~ "tool_input"
+    refute rendered =~ "/secret/path.rb"
+    refute rendered =~ "rm -rf scratch"
+
+    issue_payload = json_response(get(build_conn(), "/api/v1/MT-HTTP"), 200)
+    assert issue_payload["recent_events"] == updates_payload["recent_events"]
+  end
+
   test "phoenix observability api preserves 405, 404, and unavailable behavior" do
     unavailable_orchestrator = Module.concat(__MODULE__, :UnavailableOrchestrator)
     start_test_endpoint(orchestrator: unavailable_orchestrator, snapshot_timeout_ms: 5)

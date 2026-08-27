@@ -18,6 +18,10 @@ defmodule SymphonyElixir.ClaudeCodeBackend do
   @port_line_bytes @max_stream_frame_bytes + 1
   @post_exit_drain_ms 25
   @termination_grace_ms 250
+  @stderr_diagnostic_bytes 2_048
+  @stderr_read_limit_bytes 65_536
+  @stderr_read_timeout_ms 2_000
+  @nested_environment_marker_names ["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT"]
   @mcp_config_file_placeholder "__SYMPHONY_CLAUDE_MCP_CONFIG_FILE__"
   @tracker_mcp_path "/api/v1/agent-mcp"
   @transient_error_pattern ~r/(?:^|[^a-z0-9])(?:429|rate[_ -]?limit(?:ed)?|timeout|overload(?:ed)?|temporar(?:y|ily)|unavailable|connection(?:[_ -]?(?:reset|refused|closed|error))?|econnreset|econnrefused|too many requests)(?:$|[^a-z0-9])/
@@ -125,7 +129,7 @@ defmodule SymphonyElixir.ClaudeCodeBackend do
     input = framed_input(settings.mcp_config, prompt)
 
     case start_port(session, settings, args, byte_size(prompt), mcp_config_bytes(settings.mcp_config)) do
-      {:ok, port, local_temp_dir} ->
+      {:ok, port, cleanup} ->
         try do
           metadata = Map.put(base, :process_id, port_process_id(port))
           emit(on_message, :session_started, metadata)
@@ -165,7 +169,7 @@ defmodule SymphonyElixir.ClaudeCodeBackend do
               {:error, error}
           end
         after
-          stop_port_and_cleanup(port, local_temp_dir)
+          stop_port_and_cleanup(port, cleanup)
         end
 
       {:error, reason} ->
@@ -333,7 +337,8 @@ defmodule SymphonyElixir.ClaudeCodeBackend do
             prompt_bytes,
             mcp_bytes,
             session.tracker_binding,
-            local_temp_dir
+            local_temp_dir,
+            nil
           )
 
         case start_local_port(session.workspace, launch_script, session.tracker_binding) do
@@ -342,12 +347,22 @@ defmodule SymphonyElixir.ClaudeCodeBackend do
         end
 
       worker_host ->
+        remote_stderr_ref = remote_stderr_diagnostic_ref()
+
         launch_script =
-          launch_script(settings.command, args, prompt_bytes, mcp_bytes, session.tracker_binding, nil)
+          launch_script(
+            settings.command,
+            args,
+            prompt_bytes,
+            mcp_bytes,
+            session.tracker_binding,
+            nil,
+            remote_stderr_ref
+          )
 
         case start_remote_port(session, worker_host, launch_script) do
-          {:ok, port} -> {:ok, port, nil}
-          {:error, _reason} = error -> error
+          {:ok, port} -> {:ok, port, {:remote, worker_host, remote_stderr_ref}}
+          {:error, _reason} = error -> cleanup_local_temp_dir(nil, error)
         end
     end
   end
@@ -366,7 +381,7 @@ defmodule SymphonyElixir.ClaudeCodeBackend do
               :exit_status,
               args: [~c"-lc", String.to_charlist(launch_script)],
               cd: String.to_charlist(workspace),
-              env: tracker_secret_port_env(tracker_binding),
+              env: nested_marker_port_env() ++ tracker_secret_port_env(tracker_binding),
               line: @port_line_bytes
             ]
           )
@@ -399,7 +414,7 @@ defmodule SymphonyElixir.ClaudeCodeBackend do
     |> Enum.join(" && ")
   end
 
-  defp launch_script(command, args, prompt_bytes, mcp_bytes, tracker_binding, local_temp_dir) do
+  defp launch_script(command, args, prompt_bytes, mcp_bytes, tracker_binding, local_temp_dir, remote_stderr_file) do
     argv = Enum.map_join(args, " ", &shell_argument/1)
 
     [
@@ -407,13 +422,13 @@ defmodule SymphonyElixir.ClaudeCodeBackend do
       "umask 077",
       "prompt_file=''",
       "mcp_file=''",
-      "stderr_file='/dev/null'",
       "agent_pid=''",
       process_tree_command(),
       cleanup_command(),
       "trap cleanup EXIT",
       "trap 'terminate_agent; exit 129' HUP INT TERM",
-      temporary_file_setup(local_temp_dir, mcp_bytes),
+      temporary_file_setup(local_temp_dir, mcp_bytes, remote_stderr_file),
+      nested_environment_unset_command(),
       maybe_read_mcp_config(mcp_bytes),
       "dd bs=1 count=#{prompt_bytes} of=\"$prompt_file\" 2>/dev/null",
       tracker_secret_unset_command(tracker_binding),
@@ -447,23 +462,24 @@ defmodule SymphonyElixir.ClaudeCodeBackend do
     ~s|mcp_file=$(mktemp "${TMPDIR:-/tmp}/symphony-claude-mcp.XXXXXX")|
   end
 
-  defp temporary_file_setup(nil, mcp_bytes) do
+  defp temporary_file_setup(nil, mcp_bytes, remote_stderr_ref) when is_binary(remote_stderr_ref) do
     [
       maybe_create_mcp_file(mcp_bytes),
       ~s|prompt_file=$(mktemp "${TMPDIR:-/tmp}/symphony-claude-prompt.XXXXXX")|,
-      "stderr_file='/dev/null'"
+      ~s|stderr_file=$(mktemp "${TMPDIR:-/tmp}/#{remote_stderr_ref}.XXXXXX")|
     ]
     |> Enum.reject(&is_nil/1)
     |> Enum.join(" && ")
   end
 
-  defp temporary_file_setup(local_temp_dir, mcp_bytes) when is_binary(local_temp_dir) do
+  defp temporary_file_setup(local_temp_dir, mcp_bytes, _remote_stderr_ref) when is_binary(local_temp_dir) do
     prompt_path = Path.join(local_temp_dir, "prompt")
     mcp_path = if mcp_bytes > 0, do: Path.join(local_temp_dir, "mcp"), else: ""
+    stderr_path = Path.join(local_temp_dir, "stderr")
 
     "prompt_file=#{shell_escape(prompt_path)} && " <>
       "mcp_file=#{shell_escape(mcp_path)} && " <>
-      "stderr_file='/dev/null'"
+      "stderr_file=#{shell_escape(stderr_path)}"
   end
 
   defp maybe_read_mcp_config(0), do: nil
@@ -494,9 +510,17 @@ defmodule SymphonyElixir.ClaudeCodeBackend do
     |> Enum.map(fn name -> {String.to_charlist(name), false} end)
   end
 
+  defp nested_marker_port_env do
+    Enum.map(@nested_environment_marker_names, fn name -> {String.to_charlist(name), false} end)
+  end
+
   defp tracker_secret_unset_command(tracker_binding) do
     names = tracker_binding.secret_environment_names |> valid_environment_names()
     "unset " <> Enum.join(names, " ")
+  end
+
+  defp nested_environment_unset_command do
+    "unset " <> Enum.join(@nested_environment_marker_names, " ")
   end
 
   defp configured_workspace_root(nil) do
@@ -975,25 +999,141 @@ defmodule SymphonyElixir.ClaudeCodeBackend do
     path
   end
 
-  defp stop_port_and_cleanup(port, local_temp_dir) do
-    # credo:disable-for-next-line
+  defp stop_port_and_cleanup(port, cleanup) do
+    # credo:disable-for-next-line Credo.Check.Readability.PreferImplicitTry
     try do
       stop_port(port)
     after
-      cleanup_local_temp_dir(local_temp_dir)
+      run_turn_cleanup(cleanup)
     end
   end
 
-  defp cleanup_local_temp_dir(nil), do: :ok
+  defp run_turn_cleanup(nil), do: :ok
 
-  defp cleanup_local_temp_dir(path) when is_binary(path) do
-    File.rm_rf(path)
+  defp run_turn_cleanup(local_temp_dir) when is_binary(local_temp_dir) do
+    collect_local_stderr_diagnostic(Path.join(local_temp_dir, "stderr"))
+    File.rm_rf(local_temp_dir)
     :ok
   end
 
-  defp cleanup_local_temp_dir(path, result) do
-    cleanup_local_temp_dir(path)
+  defp run_turn_cleanup({:remote, worker_host, remote_stderr_ref}) do
+    collect_remote_stderr_diagnostic(worker_host, remote_stderr_ref)
+    :ok
+  end
+
+  defp cleanup_local_temp_dir(local_temp_dir, result) do
+    run_turn_cleanup(local_temp_dir)
     result
+  end
+
+  defp remote_stderr_diagnostic_ref do
+    "symphony-claude-stderr-#{uuid4()}"
+  end
+
+  defp collect_local_stderr_diagnostic(path) do
+    case sanitize_diagnostic_bytes(bounded_stderr_read(path), @stderr_diagnostic_bytes) do
+      {:ok, summary} ->
+        Logger.warning("Claude Code stderr diagnostic (local, #{byte_size(summary)} bytes): #{summary}")
+
+      :empty ->
+        :ok
+    end
+  end
+
+  defp bounded_stderr_read(path) do
+    case File.open(path, [:binary, :read]) do
+      {:ok, io} ->
+        try do
+          case IO.binread(io, @stderr_read_limit_bytes) do
+            data when is_binary(data) -> data
+            _ -> ""
+          end
+        after
+          File.close(io)
+        end
+
+      {:error, _reason} ->
+        ""
+    end
+  end
+
+  defp collect_remote_stderr_diagnostic(worker_host, remote_stderr_ref) do
+    tmpdir_glob = ~s|"${TMPDIR:-/tmp}/#{remote_stderr_ref}".*|
+    fallback_glob = ~s|"/tmp/#{remote_stderr_ref}".*|
+
+    command =
+      ~s|cat #{tmpdir_glob} #{fallback_glob} 2>/dev/null; rm -f -- #{tmpdir_glob} #{fallback_glob} 2>/dev/null| <>
+        "; true"
+
+    task = Task.async(fn -> SSH.run(worker_host, command, stderr_to_stdout: true) end)
+
+    ssh_result =
+      case Task.yield(task, @stderr_read_timeout_ms) do
+        {:ok, result} -> result
+        _ -> bounded_stderr_read_timeout(task)
+      end
+
+    log_remote_stderr_diagnostic(worker_host, ssh_result)
+  end
+
+  @doc false
+  @spec bounded_stderr_read_timeout(Task.t()) :: {:error, :stderr_read_timeout}
+  def bounded_stderr_read_timeout(task) do
+    _ = Task.shutdown(task, :brutal_kill)
+    {:error, :stderr_read_timeout}
+  end
+
+  defp log_remote_stderr_diagnostic(worker_host, {:ok, {raw, _status}}) do
+    case sanitize_diagnostic_bytes(raw, @stderr_diagnostic_bytes) do
+      {:ok, summary} ->
+        Logger.warning("Claude Code stderr diagnostic (#{worker_host}, #{byte_size(summary)} bytes): #{summary}")
+
+      :empty ->
+        :ok
+    end
+  end
+
+  defp log_remote_stderr_diagnostic(_worker_host, _ssh_result), do: :ok
+
+  defp sanitize_diagnostic_bytes(raw, max_bytes) when is_binary(raw) do
+    sanitized =
+      raw
+      |> String.replace_invalid()
+      |> String.replace(~r/\x1B\[[0-9;]*[A-Za-z]/, "")
+      |> String.replace(~r/\x1B./, "")
+      |> String.replace(~r/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/, "")
+      |> String.trim()
+      |> mask_credential_assignments()
+
+    cond do
+      sanitized == "" -> :empty
+      byte_size(sanitized) <= max_bytes -> {:ok, sanitized}
+      true -> {:ok, truncated_diagnostic(sanitized, max_bytes)}
+    end
+  end
+
+  defp truncated_diagnostic(sanitized, max_bytes) do
+    marker = "...[truncated]"
+    keep_bytes = max_bytes - byte_size(marker)
+
+    sanitized
+    |> binary_part(0, keep_bytes)
+    |> trim_invalid_utf8_suffix()
+    |> Kernel.<>(marker)
+  end
+
+  defp trim_invalid_utf8_suffix(value) do
+    if String.valid?(value) do
+      value
+    else
+      value
+      |> binary_part(0, byte_size(value) - 1)
+      |> trim_invalid_utf8_suffix()
+    end
+  end
+
+  defp mask_credential_assignments(value) do
+    Regex.replace(~r/(?i)\b([a-z0-9_]*(?:token|secret|api_key|apikey|password|passwd|credential|authorization|auth)[a-z0-9_]*)=("[^"]*"|'[^']*'|[^\s]+)/, value, "\\1=<redacted>")
   end
 
   @doc false

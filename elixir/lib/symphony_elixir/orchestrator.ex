@@ -2864,6 +2864,8 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp summarize_codex_update(update) do
     %{
+      backend: Map.get(update, :backend),
+      type: Map.get(update, :type),
       event: Map.get(update, :event),
       message: Map.get(update, :payload) || Map.get(update, :raw),
       timestamp: Map.get(update, :timestamp)

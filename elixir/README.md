@@ -197,7 +197,20 @@ Notes:
   orchestrator inactivity limit; the selected backend's stall timeout is always used.
 - Claude prompts are framed over stdin into a child-owned mode-`0600` temporary file, are not placed
   in argv or logs, and use the same launch contract on local and SSH workers. Declared tracker
-  secret environment variables are removed before Claude starts.
+  secret environment variables are removed before Claude starts. Claude Code nesting markers
+  (`CLAUDECODE` and `CLAUDE_CODE_ENTRYPOINT`) are also removed from the child environment, so a
+  Symphony run started inside another Claude Code session does not inherit nested-mode behavior.
+- Claude child stderr is captured to a mode-`0600` temporary file instead of the protocol stream and
+  is removed after every turn (success, failure, timeout, or cancellation). After a turn ends,
+  Symphony reads the capture once (locally before cleanup; remotely as a best-effort read-and-remove
+  SSH command), logs a sanitized summary capped at 2048 bytes with obvious credential assignments
+  masked and a truncation marker, and never writes raw stderr, prompts, tool inputs, MCP config, or
+  secrets to the Workpad, state API, or dashboard. Remote read failures degrade to no diagnostic.
+- The terminal status surface and dashboard render bounded Claude Code event summaries dispatched
+  on the typed backend: event type, tool names, turn outcome details (result subtype, exit status,
+  silence timeout, failure reason), the session identifier on session startup, and
+  provider-reported usage counts. They never include tool arguments, raw protocol frames, prompts,
+  MCP configuration, or credentials, and the orchestrator does not depend on those strings.
 - Local Claude cleanup sends `TERM` and then `KILL` to the discovered process tree. It uses
   `pgrep -P` when available, falls back to a `ps` PID/PPID table, and still attempts the direct Port
   PID when neither descendant-discovery tool exists. The SSH launch trap uses the same discovery
