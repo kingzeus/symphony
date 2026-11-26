@@ -1,13 +1,17 @@
 ---
 name: linear
 description: |
-  Use Symphony's `linear_graphql` client tool for raw Linear GraphQL
-  operations such as comment editing and upload flows.
+  Pre-built Linear GraphQL patterns for Symphony agents. Use the
+  `linear_graphql` client tool for raw operations: comment editing, state
+  transitions, PR attachments, uploads, and issue creation. Never use schema
+  introspection.
 ---
 
 # Linear GraphQL
 
 Use this skill for raw Linear GraphQL work during Symphony app-server sessions.
+Every operation the workflow needs is pre-built below; there is no schema to
+discover.
 
 ## Primary tool
 
@@ -32,51 +36,21 @@ Tool behavior:
   tool call itself completed.
 - Keep queries/mutations narrowly scoped; ask only for the fields you need.
 
-## Discovering unfamiliar operations
+## Scoped tracker tools
 
-When you need an unfamiliar mutation, input type, or object field, use targeted
-introspection through `linear_graphql`.
+Some sessions (Claude backend) expose capability-bound tracker tools instead of
+raw GraphQL: `tracker_issue_get`, `tracker_workpad_upsert`, and
+`tracker_issue_transition` (possibly prefixed `mcp__symphony_tracker__`). When
+present, prefer them for reading the current issue, syncing the workpad, and
+moving state — they need no IDs. Use the patterns below for everything else.
 
-List mutation names:
-
-```graphql
-query ListMutations {
-  __type(name: "Mutation") {
-    fields {
-      name
-    }
-  }
-}
-```
-
-Inspect a specific input object:
-
-```graphql
-query CommentCreateInputShape {
-  __type(name: "CommentCreateInput") {
-    inputFields {
-      name
-      type {
-        kind
-        name
-        ofType {
-          kind
-          name
-        }
-      }
-    }
-  }
-}
-```
-
-## Common workflows
-
-### Query an issue by key, identifier, or id
+## Query an issue by key, identifier, or id
 
 Use these progressively:
 
 - Start with `issue(id: $key)` when you have a ticket key such as `MT-686`.
-- Fall back to `issues(filter: ...)` when you need identifier search semantics.
+- Fall back to `issues(filter: { id: { eq: $key } })` when you need search
+  semantics: it returns an empty list instead of failing for unknown keys.
 - Once you have the internal issue id, prefer `issue(id: $id)` for narrower reads.
 
 Lookup by issue key:
@@ -100,13 +74,6 @@ query IssueByKey($key: String!) {
     url
     description
     updatedAt
-    links {
-      nodes {
-        id
-        url
-        title
-      }
-    }
   }
 }
 ```
@@ -115,7 +82,7 @@ Lookup by identifier filter:
 
 ```graphql
 query IssueByIdentifier($identifier: String!) {
-  issues(filter: { identifier: { eq: $identifier } }, first: 1) {
+  issues(filter: { id: { eq: $identifier } }, first: 1) {
     nodes {
       id
       identifier
@@ -181,7 +148,34 @@ query IssueDetails($id: String!) {
 }
 ```
 
-### Query team workflow states for an issue
+## Find the workpad comment
+
+The workpad is a single persistent Linear comment (see WORKFLOW.md). List the
+issue's comments and match the `## Codex Workpad` marker header; ignore resolved
+comments while searching.
+
+```graphql
+query IssueComments($id: String!) {
+  issue(id: $id) {
+    id
+    comments(first: 100) {
+      nodes {
+        id
+        body
+        resolvedAt
+        user {
+          name
+        }
+      }
+    }
+  }
+}
+```
+
+Reuse the matched comment id for every workpad update; create the workpad
+comment only when no active one exists.
+
+## Query team workflow states for an issue
 
 Use this before changing issue state when you need the exact `stateId`:
 
@@ -205,7 +199,7 @@ query IssueTeamStates($id: String!) {
 }
 ```
 
-### Edit an existing comment
+## Edit an existing comment
 
 Use `commentUpdate` through `linear_graphql`:
 
@@ -221,7 +215,7 @@ mutation UpdateComment($id: String!, $body: String!) {
 }
 ```
 
-### Create a comment
+## Create a comment
 
 Use `commentCreate` through `linear_graphql`:
 
@@ -237,7 +231,7 @@ mutation CreateComment($issueId: String!, $body: String!) {
 }
 ```
 
-### Move an issue to a different state
+## Move an issue to a different state
 
 Use `issueUpdate` with the destination `stateId`:
 
@@ -257,7 +251,7 @@ mutation MoveIssueToState($id: String!, $stateId: String!) {
 }
 ```
 
-### Attach a GitHub PR to an issue
+## Attach a GitHub PR to an issue
 
 Use the GitHub-specific attachment mutation when linking a PR:
 
@@ -295,46 +289,7 @@ mutation AttachURL($issueId: String!, $url: String!, $title: String) {
 }
 ```
 
-### Introspection patterns used during schema discovery
-
-Use these when the exact field or mutation shape is unclear:
-
-```graphql
-query QueryFields {
-  __type(name: "Query") {
-    fields {
-      name
-    }
-  }
-}
-```
-
-```graphql
-query IssueFieldArgs {
-  __type(name: "Query") {
-    fields {
-      name
-      args {
-        name
-        type {
-          kind
-          name
-          ofType {
-            kind
-            name
-            ofType {
-              kind
-              name
-            }
-          }
-        }
-      }
-    }
-  }
-}
-```
-
-### Upload a video to a comment
+## Upload a video to a comment
 
 Do this in three steps:
 
@@ -373,8 +328,79 @@ mutation FileUpload(
 }
 ```
 
+## Create a follow-up issue
+
+Use this for out-of-scope improvements discovered during execution (see
+WORKFLOW.md): a `Backlog` issue in the same project, linked `related` to the
+current issue, plus a blocking relation when the follow-up depends on the
+current issue.
+
+1. Resolve the project, team, and `Backlog` `stateId` from the project slug
+   (`tracker.provider.project_slug` in WORKFLOW.md):
+
+```graphql
+query ProjectBySlug($slug: String!) {
+  projects(filter: { slugId: { eq: $slug } }, first: 1) {
+    nodes {
+      id
+      teams {
+        nodes {
+          id
+          key
+          states {
+            nodes {
+              id
+              name
+            }
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+2. Create the issue:
+
+```graphql
+mutation CreateIssue($input: IssueCreateInput!) {
+  issueCreate(input: $input) {
+    success
+    issue {
+      id
+      identifier
+      url
+    }
+  }
+}
+```
+
+`$input` fields: `title`, `teamId`, `projectId`, `description`, and `stateId`
+(the `Backlog` state from step 1). `priority` is optional (0–4).
+
+3. Link it to the current issue:
+
+```graphql
+mutation RelateIssues($input: IssueRelationCreateInput!) {
+  issueRelationCreate(input: $input) {
+    success
+  }
+}
+```
+
+- `related` link:
+  `{ issueId: <follow-up id>, relatedIssueId: <current id>, type: related }`.
+- Follow-up depends on the current issue:
+  `{ issueId: <current id>, relatedIssueId: <follow-up id>, type: blocks }`.
+  There is no `blockedBy` relation type; express "follow-up is blocked by
+  current" as `blocks` from the current issue to the follow-up.
+
 ## Usage rules
 
+- **No introspection.** Never send `__type` or `__schema` queries. They burn
+  tokens and calls on both the agent and the tracker side. Every operation
+  this workflow needs is pre-built above; if something is missing, record the
+  gap in the workpad instead of probing the schema.
 - Use `linear_graphql` for comment edits, uploads, and ad-hoc Linear API
   queries.
 - Prefer the narrowest issue lookup that matches what you already know:
