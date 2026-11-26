@@ -248,7 +248,7 @@ State tracked while a coding-agent subprocess is running.
 
 Fields:
 
-- `backend` (`codex | claude_code`)
+- `backend` (`codex | claude_code | qoder`)
 - `session_id` (provider session identity)
 - `thread_id` (string or null)
 - `turn_id` (string or null)
@@ -375,6 +375,7 @@ Top-level keys:
 - `agent`
 - `codex`
 - `claude_code`
+- `qoder`
 
 Unknown keys SHOULD be ignored for forward compatibility.
 
@@ -464,7 +465,7 @@ Fields:
 
 - `backend` (string)
   - Default: `codex`
-  - Supported values: `codex`, `claude_code`.
+  - Supported values: `codex`, `claude_code`, `qoder`.
   - Selects one backend for future worker sessions. Invalid values fail configuration validation.
 - `max_concurrent_agents` (integer)
   - Default: `10`
@@ -555,6 +556,38 @@ Fields:
 - `stall_timeout_ms` (non-negative integer)
   - Default: `300000` (5 minutes).
   - Used by orchestrator stall detection when `agent.backend == claude_code`; `0` disables it.
+
+#### 5.3.8 `qoder` (object)
+
+The Qoder backend is an independent `AgentServer` implementation sharing the `StreamJsonCore`
+execution engine and `StreamJsonCore.Payload` interpretation with Claude Code (Qoder CLI emits the
+same `stream-json` event/result shape). It does not implement the Codex JSON-RPC app-server protocol.
+
+Fields:
+
+- `command` (string shell command)
+  - Default: `qoder`
+  - MAY include a shell prefix such as `env NAME=value qoder`.
+- `model` (string or null)
+  - Default: omitted, allowing Qoder CLI to choose its configured/default model.
+- `permission_mode` (string)
+  - Default: `auto`
+  - Supported values: `default`, `auto`, `accept_edits`, `dont_ask`, `bypass_permissions` (Qoder CLI
+    uses snake_case and has no `plan` mode).
+  - `bypass_permissions` removes Qoder CLI's approval boundary. It MUST NOT be selected by default
+    and SHOULD be used only for trusted code inside a disposable, strongly isolated worker.
+- `allowed_tools` / `disallowed_tools` (list of strings)
+  - Default: `[]`. Passed as repeated `--allowed-tools` / `--disallowed-tools` (kebab-case) options.
+- `mcp_config` (string or object or null)
+  - Passed to Qoder CLI's `--mcp-config`; objects are JSON encoded. Restricted Tracker MCP injection
+    is added in a later phase (P4); string/path values remain explicit pass-through.
+- `reasoning_effort` (string or null)
+  - Default: omitted. Passed as `--reasoning-effort` when set.
+- `turn_timeout_ms` (positive integer)
+  - Default: `3600000` (1 hour). Maximum silence interval for Qoder `stream-json` output.
+- `stall_timeout_ms` (non-negative integer)
+  - Default: `300000` (5 minutes).
+  - Used by orchestrator stall detection when `agent.backend == qoder`; `0` disables it.
 
 ### 5.4 Prompt Template Contract
 
@@ -1131,7 +1164,7 @@ Transport handling requirements:
 
 Every backend emits one normalized event type owned by `AgentServer`. Each event SHOULD include:
 
-- `backend` (`codex | claude_code`)
+- `backend` (`codex | claude_code | qoder`)
 - `type` (provider-neutral enum/string)
 - `event` (enum/string)
 - `timestamp` (UTC timestamp)

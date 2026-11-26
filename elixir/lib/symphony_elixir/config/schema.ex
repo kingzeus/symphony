@@ -232,6 +232,62 @@ defmodule SymphonyElixir.Config.Schema do
     end
   end
 
+  defmodule Qoder do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @primary_key false
+    embedded_schema do
+      field(:command, :string, default: "qoder")
+      field(:model, :string)
+      field(:permission_mode, :string, default: "auto")
+      field(:allowed_tools, {:array, :string}, default: [])
+      field(:disallowed_tools, {:array, :string}, default: [])
+      field(:mcp_config, StringOrMap)
+      field(:reasoning_effort, :string)
+      field(:turn_timeout_ms, :integer, default: 3_600_000)
+      field(:stall_timeout_ms, :integer, default: 300_000)
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(
+        attrs,
+        [
+          :command,
+          :model,
+          :permission_mode,
+          :allowed_tools,
+          :disallowed_tools,
+          :mcp_config,
+          :reasoning_effort,
+          :turn_timeout_ms,
+          :stall_timeout_ms
+        ],
+        empty_values: []
+      )
+      |> validate_required([:command, :permission_mode])
+      |> validate_change(:command, fn :command, command ->
+        if command != "" and String.trim(command) == "" do
+          [command: "can't be blank"]
+        else
+          []
+        end
+      end)
+      |> validate_inclusion(:permission_mode, [
+        "default",
+        "auto",
+        "accept_edits",
+        "dont_ask",
+        "bypass_permissions"
+      ])
+      |> validate_number(:turn_timeout_ms, greater_than: 0)
+      |> validate_number(:stall_timeout_ms, greater_than_or_equal_to: 0)
+    end
+  end
+
   defmodule Codex do
     @moduledoc false
     use Ecto.Schema
@@ -358,6 +414,7 @@ defmodule SymphonyElixir.Config.Schema do
     embeds_one(:agent, Agent, on_replace: :update, defaults_to_struct: true)
     embeds_one(:codex, Codex, on_replace: :update, defaults_to_struct: true)
     embeds_one(:claude_code, ClaudeCode, on_replace: :update, defaults_to_struct: true)
+    embeds_one(:qoder, Qoder, on_replace: :update, defaults_to_struct: true)
     embeds_one(:hooks, Hooks, on_replace: :update, defaults_to_struct: true)
     embeds_one(:observability, Observability, on_replace: :update, defaults_to_struct: true)
     embeds_one(:server, Server, on_replace: :update, defaults_to_struct: true)
@@ -453,6 +510,7 @@ defmodule SymphonyElixir.Config.Schema do
     |> cast_embed(:agent, with: &Agent.changeset/2)
     |> cast_embed(:codex, with: &Codex.changeset/2)
     |> cast_embed(:claude_code, with: &ClaudeCode.changeset/2)
+    |> cast_embed(:qoder, with: &Qoder.changeset/2)
     |> cast_embed(:hooks, with: &Hooks.changeset/2)
     |> cast_embed(:observability, with: &Observability.changeset/2)
     |> cast_embed(:server, with: &Server.changeset/2)
@@ -528,7 +586,12 @@ defmodule SymphonyElixir.Config.Schema do
       | mcp_config: normalize_optional_map(settings.claude_code.mcp_config)
     }
 
-    %{settings | tracker: tracker, workspace: workspace, codex: codex, claude_code: claude_code}
+    qoder = %{
+      settings.qoder
+      | mcp_config: normalize_optional_map(settings.qoder.mcp_config)
+    }
+
+    %{settings | tracker: tracker, workspace: workspace, codex: codex, claude_code: claude_code, qoder: qoder}
   end
 
   defp normalize_keys(value) when is_map(value) do

@@ -158,7 +158,7 @@ defmodule SymphonyElixir.AgentServer do
               rate_limits: nil
 
     @type t :: %__MODULE__{
-            backend: :codex | :claude_code,
+            backend: :codex | :claude_code | :qoder,
             type: atom(),
             timestamp: DateTime.t(),
             session_id: String.t() | nil,
@@ -179,8 +179,8 @@ defmodule SymphonyElixir.AgentServer do
             rate_limits: term()
           }
 
-    @spec new(:codex | :claude_code, atom(), keyword()) :: t()
-    def new(backend, type, opts \\ []) when backend in [:codex, :claude_code] and is_atom(type) do
+    @spec new(:codex | :claude_code | :qoder, atom(), keyword()) :: t()
+    def new(backend, type, opts \\ []) when backend in [:codex, :claude_code, :qoder] and is_atom(type) do
       process_id = normalize_process_id(Keyword.get(opts, :process_id))
       payload = Keyword.get(opts, :payload)
 
@@ -352,7 +352,8 @@ defmodule SymphonyElixir.AgentServer do
 
   @backends %{
     codex: SymphonyElixir.Codex.AppServer,
-    claude_code: SymphonyElixir.ClaudeCodeBackend
+    claude_code: SymphonyElixir.ClaudeCodeBackend,
+    qoder: SymphonyElixir.QoderBackend
   }
 
   @doc """
@@ -382,14 +383,14 @@ defmodule SymphonyElixir.AgentServer do
     end
   end
 
-  @spec backend_name(module()) :: :codex | :claude_code
+  @spec backend_name(module()) :: :codex | :claude_code | :qoder
   def backend_name(module) do
     Enum.find_value(@backends, :codex, fn {name, backend_module} ->
       if backend_module == module, do: name
     end)
   end
 
-  @spec normalize_event(:codex | :claude_code, Event.t() | map()) :: Event.t()
+  @spec normalize_event(:codex | :claude_code | :qoder, Event.t() | map()) :: Event.t()
   def normalize_event(_backend, %Event{} = event), do: event
 
   def normalize_event(backend, update) when is_map(update) do

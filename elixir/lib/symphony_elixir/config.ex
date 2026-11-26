@@ -125,7 +125,7 @@ defmodule SymphonyElixir.Config do
     end
   end
 
-  @spec agent_backend() :: :codex | :claude_code
+  @spec agent_backend() :: :codex | :claude_code | :qoder
   def agent_backend do
     String.to_existing_atom(settings!().agent.backend)
   rescue
@@ -138,13 +138,14 @@ defmodule SymphonyElixir.Config do
   @spec agent_stall_timeout_ms() :: non_neg_integer()
   def agent_stall_timeout_ms, do: agent_stall_timeout_ms(agent_backend())
 
-  @spec agent_stall_timeout_ms(:codex | :claude_code) :: non_neg_integer()
-  def agent_stall_timeout_ms(backend) when backend in [:codex, :claude_code] do
+  @spec agent_stall_timeout_ms(:codex | :claude_code | :qoder) :: non_neg_integer()
+  def agent_stall_timeout_ms(backend) when backend in [:codex, :claude_code, :qoder] do
     settings = settings!()
 
     case backend do
       :claude_code -> settings.claude_code.stall_timeout_ms
       :codex -> settings.codex.stall_timeout_ms
+      :qoder -> settings.qoder.stall_timeout_ms
     end
   end
 
@@ -160,6 +161,23 @@ defmodule SymphonyElixir.Config do
       disallowed_tools: settings.disallowed_tools,
       mcp_config: settings.mcp_config,
       include_partial_messages: settings.include_partial_messages,
+      turn_timeout_ms: settings.turn_timeout_ms,
+      stall_timeout_ms: settings.stall_timeout_ms
+    }
+  end
+
+  @spec qoder_runtime_settings() :: map()
+  def qoder_runtime_settings do
+    settings = settings!().qoder
+
+    %{
+      command: settings.command,
+      model: settings.model,
+      permission_mode: settings.permission_mode,
+      allowed_tools: settings.allowed_tools,
+      disallowed_tools: settings.disallowed_tools,
+      mcp_config: settings.mcp_config,
+      reasoning_effort: settings.reasoning_effort,
       turn_timeout_ms: settings.turn_timeout_ms,
       stall_timeout_ms: settings.stall_timeout_ms
     }

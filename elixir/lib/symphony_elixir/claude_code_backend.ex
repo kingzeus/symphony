@@ -2,9 +2,9 @@ defmodule SymphonyElixir.ClaudeCodeBackend do
   @moduledoc """
   Claude Code CLI backend using non-interactive newline-delimited `stream-json`.
 
-  Provider-specific dialect (flags, event interpretation, usage/error extraction,
-  native env markers) over the shared `StreamJsonCore` execution engine, which owns
-  port spawn, the receive loop, process-tree cleanup, and stderr diagnostics.
+  Provider-specific dialect (flags, env markers, rate-limit shape) over the shared
+  `StreamJsonCore` execution engine and `StreamJsonCore.Payload` interpretation,
+  which Claude Code and Qoder CLI share (their stream-json event shapes match).
   """
 
   @behaviour SymphonyElixir.AgentServer
@@ -13,11 +13,11 @@ defmodule SymphonyElixir.ClaudeCodeBackend do
   require Logger
 
   alias SymphonyElixir.AgentServer
-  alias SymphonyElixir.AgentServer.{Approval, Error, Usage, WorkspaceGuard}
+  alias SymphonyElixir.AgentServer.{Error, WorkspaceGuard}
   alias SymphonyElixir.{ClaudeTrackerMCP, Config, HttpServer, PathSafety, StreamJsonCore, Tracker}
+  alias SymphonyElixir.StreamJsonCore.Payload
 
   @tracker_mcp_path "/api/v1/agent-mcp"
-  @transient_error_pattern ~r/(?:^|[^a-z0-9])(?:429|rate[_ -]?limit(?:ed)?|timeout|overload(?:ed)?|temporar(?:y|ily)|unavailable|connection(?:[_ -]?(?:reset|refused|closed|error))?|econnreset|econnrefused|too many requests)(?:$|[^a-z0-9])/
 
   @type session :: %{
           backend: :claude_code,
@@ -350,210 +350,17 @@ defmodule SymphonyElixir.ClaudeCodeBackend do
   def mcp_config_placeholder, do: "__SYMPHONY_CLAUDE_MCP_CONFIG_FILE__"
 
   @impl SymphonyElixir.StreamJsonCore.Dialect
-  def supported_payload?(payload) when is_map(payload) do
-    Map.get(payload, "type") in [
-      "result",
-      "error",
-      "stream_event",
-      "assistant",
-      "user",
-      "tool_use",
-      "tool_result",
-      "system"
-    ]
-  end
+  def usage_identity_tag, do: :claude_result
 
   @impl SymphonyElixir.StreamJsonCore.Dialect
-  def handle_payload(_payload, _raw, _on_message, _metadata, {:error, %Error{}} = terminal_error),
-    do: terminal_error
+  def rate_limits(payload), do: claude_rate_limits(payload)
 
-  def handle_payload(%{"type" => "result"} = payload, raw, on_message, metadata, _result) do
-    rate_limits = claude_rate_limits(payload)
+  @impl SymphonyElixir.StreamJsonCore.Dialect
+  def supported_payload?(payload), do: Payload.supported_payload?(payload)
 
-    cond do
-      permission_denials(payload) != [] ->
-        handle_permission_denial(payload, raw, on_message, metadata, rate_limits)
-
-      Map.get(payload, "is_error") == true or error_result_subtype?(Map.get(payload, "subtype")) ->
-        error = provider_error(payload)
-        usage = claude_failure_usage(payload, metadata)
-
-        emit(
-          on_message,
-          :turn_failed,
-          Map.merge(metadata, %{error: error, usage: usage, rate_limits: rate_limits, payload: payload, raw: raw})
-        )
-
-        {:error, error}
-
-      true ->
-        case valid_provider_session_id(payload) do
-          {:ok, provider_session_id} ->
-            usage = claude_usage(payload, provider_session_id, metadata.turn_id)
-
-            emit(
-              on_message,
-              :turn_completed,
-              Map.merge(metadata, %{
-                session_id: provider_session_id,
-                usage: usage,
-                rate_limits: rate_limits,
-                payload: payload,
-                raw: raw
-              })
-            )
-
-            {:ok, provider_session_id, usage, payload}
-
-          :error ->
-            error =
-              Error.new(:protocol, "Claude Code result event did not include a valid session_id",
-                code: :invalid_session_id,
-                retryable?: false,
-                raw: payload
-              )
-
-            emit(
-              on_message,
-              :malformed_protocol,
-              Map.merge(metadata, %{
-                error: error,
-                usage: claude_failure_usage(payload, metadata),
-                rate_limits: rate_limits,
-                payload: payload,
-                raw: raw
-              })
-            )
-
-            {:error, error}
-        end
-    end
-  end
-
-  def handle_payload(%{"type" => "error"} = payload, raw, on_message, metadata, _result) do
-    error = provider_error(payload)
-    usage = claude_failure_usage(payload, metadata)
-    emit(on_message, :turn_failed, Map.merge(metadata, %{error: error, usage: usage, payload: payload, raw: raw}))
-    {:error, error}
-  end
-
-  def handle_payload(%{"type" => "stream_event"} = payload, raw, on_message, metadata, result) do
-    emit(on_message, :progress, Map.merge(metadata, %{payload: payload, raw: raw}))
-    result
-  end
-
-  def handle_payload(%{"type" => "assistant"} = payload, raw, on_message, metadata, result) do
-    type = if tool_activity?(payload), do: :tool_activity, else: :notification
-    emit(on_message, type, Map.merge(metadata, %{payload: payload, raw: raw}))
-    result
-  end
-
-  def handle_payload(%{"type" => type} = payload, raw, on_message, metadata, result)
-      when type in ["user", "tool_use", "tool_result"] do
-    emit(on_message, :tool_activity, Map.merge(metadata, %{payload: payload, raw: raw}))
-    result
-  end
-
+  @impl SymphonyElixir.StreamJsonCore.Dialect
   def handle_payload(payload, raw, on_message, metadata, result) do
-    emit(on_message, :notification, Map.merge(metadata, %{payload: payload, raw: raw}))
-    result
-  end
-
-  defp handle_permission_denial(payload, raw, on_message, metadata, rate_limits) do
-    denials = permission_denials(payload)
-
-    approval =
-      Approval.new(:tool, :required,
-        request_id: {metadata.session_id, metadata.turn_id},
-        auto_approved?: false,
-        raw: denials
-      )
-
-    error =
-      Error.new(:approval_required, "Claude Code requires tool approval",
-        code: :permission_denied,
-        retryable?: false,
-        blocked?: true,
-        raw: payload
-      )
-
-    usage = claude_failure_usage(payload, metadata)
-
-    emit(
-      on_message,
-      :approval_required,
-      Map.merge(metadata, %{
-        approval: approval,
-        error: error,
-        usage: usage,
-        rate_limits: rate_limits,
-        payload: payload,
-        raw: raw
-      })
-    )
-
-    {:error, error}
-  end
-
-  defp permission_denials(payload) do
-    case Map.get(payload, "permission_denials") do
-      denials when is_list(denials) -> denials
-      _ -> []
-    end
-  end
-
-  defp error_result_subtype?(subtype) when is_binary(subtype), do: String.starts_with?(subtype, "error_")
-  defp error_result_subtype?(_subtype), do: false
-
-  defp provider_error(payload) do
-    raw_error = Map.get(payload, "error") || payload
-
-    code = provider_error_code(raw_error) || Map.get(payload, "subtype") || :provider_error
-    message = provider_error_message(raw_error)
-
-    Error.new(:provider, message,
-      code: code,
-      retryable?: transient_provider_error?(code, message),
-      raw: payload
-    )
-  end
-
-  defp provider_error_message(%{"message" => message}) when is_binary(message), do: message
-  defp provider_error_message(message) when is_binary(message), do: message
-  defp provider_error_message(error), do: inspect(error)
-
-  defp provider_error_code(%{"type" => type}) when is_binary(type), do: type
-  defp provider_error_code(%{"code" => code}), do: code
-  defp provider_error_code(_error), do: nil
-
-  defp transient_provider_error?(code, message) do
-    text = "#{code} #{message}"
-    Regex.match?(@transient_error_pattern, String.downcase(text))
-  end
-
-  defp claude_usage(payload, session_id, turn_id) do
-    raw = Map.get(payload, "usage") || %{}
-
-    Usage.delta(
-      :turn,
-      non_negative_integer(Map.get(raw, "input_tokens")),
-      non_negative_integer(Map.get(raw, "output_tokens")),
-      {:claude_result, session_id, turn_id},
-      total_tokens: non_negative_integer(Map.get(raw, "total_tokens")),
-      cache_read_input_tokens: non_negative_integer(Map.get(raw, "cache_read_input_tokens")),
-      cache_creation_input_tokens: non_negative_integer(Map.get(raw, "cache_creation_input_tokens")),
-      raw: raw
-    )
-  end
-
-  defp claude_failure_usage(payload, metadata) do
-    session_id =
-      case valid_provider_session_id(payload) do
-        {:ok, provider_session_id} -> provider_session_id
-        :error -> metadata.session_id
-      end
-
-    claude_usage(payload, session_id, metadata.turn_id)
+    Payload.handle_payload(payload, raw, on_message, metadata, result, __MODULE__)
   end
 
   # Claude reports subscription/gateway limits as percentage windows
@@ -609,37 +416,6 @@ defmodule SymphonyElixir.ClaudeCodeBackend do
   end
 
   defp claude_spend_credits(_spend), do: nil
-
-  defp valid_provider_session_id(payload) do
-    case Map.get(payload, "session_id") do
-      session_id when is_binary(session_id) ->
-        trimmed = String.trim(session_id)
-
-        if String.match?(
-             trimmed,
-             ~r/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/
-           ) do
-          {:ok, trimmed}
-        else
-          :error
-        end
-
-      _ ->
-        :error
-    end
-  end
-
-  defp non_negative_integer(value) when is_integer(value) and value >= 0, do: value
-  defp non_negative_integer(_value), do: nil
-
-  defp tool_activity?(payload) do
-    payload
-    |> get_in(["message", "content"])
-    |> case do
-      content when is_list(content) -> Enum.any?(content, &(is_map(&1) and Map.get(&1, "type") == "tool_use"))
-      _ -> false
-    end
-  end
 
   defp emit(on_message, type, attrs) do
     StreamJsonCore.emit(on_message, :claude_code, type, attrs)

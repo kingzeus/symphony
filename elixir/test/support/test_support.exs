@@ -126,6 +126,15 @@ defmodule SymphonyElixir.TestSupport do
           claude_code_include_partial_messages: true,
           claude_code_turn_timeout_ms: 3_600_000,
           claude_code_stall_timeout_ms: 300_000,
+          qoder_command: "qoder",
+          qoder_model: nil,
+          qoder_permission_mode: "auto",
+          qoder_allowed_tools: [],
+          qoder_disallowed_tools: [],
+          qoder_mcp_config: nil,
+          qoder_reasoning_effort: nil,
+          qoder_turn_timeout_ms: 3_600_000,
+          qoder_stall_timeout_ms: 300_000,
           hook_after_create: nil,
           hook_before_run: nil,
           hook_after_run: nil,
@@ -175,6 +184,15 @@ defmodule SymphonyElixir.TestSupport do
     claude_code_include_partial_messages = Keyword.get(config, :claude_code_include_partial_messages)
     claude_code_turn_timeout_ms = Keyword.get(config, :claude_code_turn_timeout_ms)
     claude_code_stall_timeout_ms = Keyword.get(config, :claude_code_stall_timeout_ms)
+    qoder_command = Keyword.get(config, :qoder_command)
+    qoder_model = Keyword.get(config, :qoder_model)
+    qoder_permission_mode = Keyword.get(config, :qoder_permission_mode)
+    qoder_allowed_tools = Keyword.get(config, :qoder_allowed_tools)
+    qoder_disallowed_tools = Keyword.get(config, :qoder_disallowed_tools)
+    qoder_mcp_config = Keyword.get(config, :qoder_mcp_config)
+    qoder_reasoning_effort = Keyword.get(config, :qoder_reasoning_effort)
+    qoder_turn_timeout_ms = Keyword.get(config, :qoder_turn_timeout_ms)
+    qoder_stall_timeout_ms = Keyword.get(config, :qoder_stall_timeout_ms)
     hook_after_create = Keyword.get(config, :hook_after_create)
     hook_before_run = Keyword.get(config, :hook_before_run)
     hook_after_run = Keyword.get(config, :hook_after_run)
@@ -229,6 +247,16 @@ defmodule SymphonyElixir.TestSupport do
         "  include_partial_messages: #{yaml_value(claude_code_include_partial_messages)}",
         "  turn_timeout_ms: #{yaml_value(claude_code_turn_timeout_ms)}",
         "  stall_timeout_ms: #{yaml_value(claude_code_stall_timeout_ms)}",
+        "qoder:",
+        "  command: #{yaml_value(qoder_command)}",
+        "  model: #{yaml_value(qoder_model)}",
+        "  permission_mode: #{yaml_value(qoder_permission_mode)}",
+        "  allowed_tools: #{yaml_value(qoder_allowed_tools)}",
+        "  disallowed_tools: #{yaml_value(qoder_disallowed_tools)}",
+        "  mcp_config: #{yaml_value(qoder_mcp_config)}",
+        "  reasoning_effort: #{yaml_value(qoder_reasoning_effort)}",
+        "  turn_timeout_ms: #{yaml_value(qoder_turn_timeout_ms)}",
+        "  stall_timeout_ms: #{yaml_value(qoder_stall_timeout_ms)}",
         hooks_yaml(hook_after_create, hook_before_run, hook_after_run, hook_before_remove, hook_timeout_ms),
         observability_yaml(observability_enabled, observability_refresh_ms, observability_render_interval_ms),
         server_yaml(server_port, server_host),

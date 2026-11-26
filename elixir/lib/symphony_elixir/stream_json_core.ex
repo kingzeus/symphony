@@ -24,6 +24,8 @@ defmodule SymphonyElixir.StreamJsonCore do
     @callback prompt_env_name() :: String.t()
     @callback stderr_env_name() :: String.t()
     @callback mcp_config_placeholder() :: String.t()
+    @callback usage_identity_tag() :: atom()
+    @callback rate_limits(map()) :: map() | nil
     @callback supported_payload?(map()) :: boolean()
     @callback handle_payload(
                 payload :: map(),
