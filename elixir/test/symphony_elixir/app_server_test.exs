@@ -1902,6 +1902,47 @@ defmodule SymphonyElixir.AppServerTest do
     refute File.exists?(turn_trace)
   end
 
+  test "effort label 覆盖 codex command 的 model_reasoning_effort（替换/追加）" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-codex-effort-#{System.unique_integer([:positive])}")
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "MT-EFFORT")
+    File.mkdir_p!(workspace)
+    on_exit(fn -> File.rm_rf(test_root) end)
+
+    capture = Path.join(test_root, "argv")
+    fake = Path.join(test_root, "fake-codex")
+
+    File.write!(fake, """
+    #!/bin/sh
+    printf '%s\\n' "$@" > #{capture}
+    exit 0
+    """)
+
+    File.chmod!(fake, 0o755)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      codex_command: "#{fake} app-server --config model_reasoning_effort=xhigh"
+    )
+
+    _ = AppServer.start_session(workspace, effort: "high")
+    assert wait_for_file(capture)
+    assert File.read!(capture) =~ "model_reasoning_effort=high"
+    refute File.read!(capture) =~ "model_reasoning_effort=xhigh"
+
+    File.rm!(capture)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      codex_command: "#{fake} app-server"
+    )
+
+    _ = AppServer.start_session(workspace, effort: "medium")
+    assert wait_for_file(capture)
+    assert File.read!(capture) =~ "-c"
+    assert File.read!(capture) =~ "model_reasoning_effort=medium"
+  end
+
   defp wait_for_file(path, attempts \\ 100)
   defp wait_for_file(_path, 0), do: false
 

@@ -53,7 +53,8 @@ defmodule SymphonyElixir.ClaudeCodeBackend do
            worker_host: worker_host,
            turn_count: 0,
            runtime_settings: runtime_settings,
-           tracker_binding: tracker_binding
+           tracker_binding: tracker_binding,
+           effort: Keyword.get(opts, :effort)
          }}
 
       {:error, reason} ->
@@ -198,6 +199,7 @@ defmodule SymphonyElixir.ClaudeCodeBackend do
     |> add_session_args(session)
     |> maybe_add_option("--model", settings.model)
     |> maybe_add_option("--permission-mode", settings.permission_mode)
+    |> maybe_add_option("--effort", session.effort)
     |> add_repeated_options("--allowedTools", settings.allowed_tools)
     |> add_repeated_options("--disallowedTools", settings.disallowed_tools)
     |> maybe_add_option("--mcp-config", mcp_config_argument(settings.mcp_config))

@@ -1550,7 +1550,13 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host) do
-    backend_module = Config.agent_backend_module()
+    route = SymphonyElixir.AgentRoute.resolve(issue)
+
+    Enum.each(route.warnings, fn warning ->
+      Logger.warning("Agent route warning for #{issue_context(issue)}: #{warning}")
+    end)
+
+    backend_module = AgentServer.backend_module(route.backend)
     backend = AgentServer.backend_name(backend_module)
     stall_timeout_ms = Config.agent_stall_timeout_ms(backend)
 
@@ -1558,7 +1564,8 @@ defmodule SymphonyElixir.Orchestrator do
            AgentRunner.run(issue, recipient,
              attempt: attempt,
              worker_host: worker_host,
-             backend_module: backend_module
+             backend_module: backend_module,
+             effort: route.effort
            )
          end) do
       {:ok, pid} ->

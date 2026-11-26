@@ -43,12 +43,13 @@ defmodule SymphonyElixir.Codex.AppServer do
   @impl true
   def start_session(workspace, opts \\ []) do
     worker_host = Keyword.get(opts, :worker_host)
+    effort = Keyword.get(opts, :effort)
     dynamic_tool_binding = DynamicTool.bind()
 
     result =
       with {:ok, %{workspace: expanded_workspace, workspace_root: workspace_root}} <-
              validate_workspace_context(workspace, worker_host),
-           {:ok, port} <- start_port(expanded_workspace, worker_host, dynamic_tool_binding) do
+           {:ok, port} <- start_port(expanded_workspace, worker_host, dynamic_tool_binding, effort) do
         metadata = port_metadata(port, worker_host)
 
         with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
@@ -233,7 +234,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp start_port(workspace, nil, dynamic_tool_binding) do
+  defp start_port(workspace, nil, dynamic_tool_binding, effort) do
     executable = System.find_executable("bash")
 
     if is_nil(executable) do
@@ -246,7 +247,7 @@ defmodule SymphonyElixir.Codex.AppServer do
             :binary,
             :exit_status,
             :stderr_to_stdout,
-            args: [~c"-lc", String.to_charlist(local_launch_command(dynamic_tool_binding))],
+            args: [~c"-lc", String.to_charlist(local_launch_command(dynamic_tool_binding, effort))],
             cd: String.to_charlist(workspace),
             env: tracker_secret_port_env(dynamic_tool_binding),
             line: @port_line_bytes
@@ -257,28 +258,38 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp start_port(workspace, worker_host, dynamic_tool_binding) when is_binary(worker_host) do
-    remote_command = remote_launch_command(workspace, dynamic_tool_binding)
+  defp start_port(workspace, worker_host, dynamic_tool_binding, effort) when is_binary(worker_host) do
+    remote_command = remote_launch_command(workspace, dynamic_tool_binding, effort)
     SSH.start_port(worker_host, remote_command, line: @port_line_bytes)
   end
 
-  defp local_launch_command(dynamic_tool_binding) do
+  defp local_launch_command(dynamic_tool_binding, effort) do
     [
       tracker_secret_unset_command(dynamic_tool_binding),
-      "exec #{Config.settings!().codex.command}"
+      "exec #{apply_effort(Config.settings!().codex.command, effort)}"
     ]
     |> Enum.reject(&is_nil/1)
     |> Enum.join(" && ")
   end
 
-  defp remote_launch_command(workspace, dynamic_tool_binding) when is_binary(workspace) do
+  defp remote_launch_command(workspace, dynamic_tool_binding, effort) when is_binary(workspace) do
     [
       "cd #{shell_escape(workspace)}",
       tracker_secret_unset_command(dynamic_tool_binding),
-      "exec #{Config.settings!().codex.command}"
+      "exec #{apply_effort(Config.settings!().codex.command, effort)}"
     ]
     |> Enum.reject(&is_nil/1)
     |> Enum.join(" && ")
+  end
+
+  defp apply_effort(command, nil), do: command
+
+  defp apply_effort(command, effort) when is_binary(effort) do
+    if command =~ ~r/model_reasoning_effort\s*=\s*\S+/ do
+      Regex.replace(~r/(model_reasoning_effort\s*=\s*)\S+/, command, "\\1#{effort}")
+    else
+      command <> " -c model_reasoning_effort=#{effort}"
+    end
   end
 
   defp tracker_secret_port_env(dynamic_tool_binding) do

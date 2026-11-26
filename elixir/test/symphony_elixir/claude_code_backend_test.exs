@@ -2096,6 +2096,21 @@ defmodule SymphonyElixir.ClaudeCodeBackendTest do
     assert :ok = ClaudeCodeBackend.stop_session(%{backend: :claude_code})
   end
 
+  test "effort label 经 --effort 传入 CLI", context do
+    trace = Path.join(context.test_root, "effort.trace")
+    fake = install_fake_claude!(context.test_root, success_script(trace))
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: context.workspace_root,
+      agent_backend: "claude_code",
+      claude_code_command: fake
+    )
+
+    {:ok, session} = ClaudeCodeBackend.start_session(context.workspace, effort: "high")
+    assert {:ok, _} = ClaudeCodeBackend.run_turn(session, "go", context.issue)
+    assert File.read!(trace) =~ "--effort|high"
+  end
+
   defp install_fake_claude!(test_root, script, suffix \\ "default") do
     path = Path.join(test_root, "fake-claude-#{suffix}")
     File.write!(path, script)

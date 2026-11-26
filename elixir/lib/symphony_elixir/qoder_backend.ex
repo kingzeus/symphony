@@ -58,7 +58,8 @@ defmodule SymphonyElixir.QoderBackend do
            worker_host: worker_host,
            turn_count: 0,
            runtime_settings: runtime_settings,
-           tracker_binding: tracker_binding
+           tracker_binding: tracker_binding,
+           effort: Keyword.get(opts, :effort)
          }}
 
       {:error, reason} ->
@@ -201,7 +202,7 @@ defmodule SymphonyElixir.QoderBackend do
     |> add_session_args(session)
     |> maybe_add_option("--model", settings.model)
     |> maybe_add_option("--permission-mode", settings.permission_mode)
-    |> maybe_add_option("--reasoning-effort", settings.reasoning_effort)
+    |> maybe_add_option("--reasoning-effort", session.effort || settings.reasoning_effort)
     |> add_repeated_options("--allowed-tools", settings.allowed_tools)
     |> add_repeated_options("--disallowed-tools", settings.disallowed_tools)
     |> maybe_add_option("--mcp-config", mcp_config_argument(settings.mcp_config))

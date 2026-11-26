@@ -498,6 +498,24 @@ defmodule SymphonyElixir.QoderBackendTest do
     refute trace_text =~ "--model|"
   end
 
+  test "effort label 经 --reasoning-effort 覆盖配置", context do
+    trace = Path.join(context.test_root, "effort.trace")
+    fake = install_fake_qoder!(context.test_root, success_script(trace))
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: context.workspace_root,
+      agent_backend: "qoder",
+      qoder_command: fake,
+      qoder_reasoning_effort: "low"
+    )
+
+    {:ok, session} = QoderBackend.start_session(context.workspace, effort: "high")
+    assert {:ok, _} = QoderBackend.run_turn(session, "go", context.issue)
+    argv = File.read!(trace)
+    assert argv =~ "--reasoning-effort|high"
+    refute argv =~ "--reasoning-effort|low"
+  end
+
   defp install_fake_qoder!(test_root, script, suffix \\ "default") do
     path = Path.join(test_root, "fake-qoder-#{suffix}")
     File.write!(path, script)

@@ -467,6 +467,10 @@ Fields:
   - Default: `codex`
   - Supported values: `codex`, `claude_code`, `qoder`.
   - Selects one backend for future worker sessions. Invalid values fail configuration validation.
+- `default_effort` (string or null)
+  - Default: omitted (no effort override).
+  - Supported values: `low`, `medium`, `high`, `xhigh`, `max`.
+  - Default reasoning effort when an issue carries no `effort::` label.
 - `max_concurrent_agents` (integer)
   - Default: `10`
   - Changes SHOULD be re-applied at runtime and affect subsequent dispatch decisions.
@@ -481,6 +485,17 @@ Fields:
   - Default: empty map.
   - State keys are normalized (`trim + lowercase`) for lookup.
   - Invalid entries (non-positive or non-numeric) are ignored.
+
+Label routing (per issue):
+
+- Issue labels MAY override backend and effort using a `key::value` namespace:
+  `backend::<registered_name>` (e.g. `backend::qoder`) and `effort::<level>` (e.g. `effort::high`).
+- Labels are normalized (`trim + lowercase`). Unknown backend names and invalid effort values are
+  ignored. Precedence is issue label > `agent.backend` / `agent.default_effort`.
+- Conflicting labels (multiple `backend::` or multiple `effort::`) fall back to the configured
+  default and emit a warning rather than silently selecting one.
+- Effort is normalized per backend before being passed to the CLI (Codex collapses `max` to `xhigh`;
+  Claude uses `--effort`, Qoder `--reasoning-effort`, Codex `model_reasoning_effort`).
 
 #### 5.3.6 `codex` (object)
 

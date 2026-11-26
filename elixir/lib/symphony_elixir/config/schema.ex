@@ -152,6 +152,7 @@ defmodule SymphonyElixir.Config.Schema do
     @primary_key false
     embedded_schema do
       field(:backend, :string, default: "codex")
+      field(:default_effort, :string)
       field(:max_concurrent_agents, :integer, default: 10)
       field(:max_turns, :integer, default: 20)
       field(:max_retry_backoff_ms, :integer, default: 300_000)
@@ -163,10 +164,18 @@ defmodule SymphonyElixir.Config.Schema do
       schema
       |> cast(
         attrs,
-        [:backend, :max_concurrent_agents, :max_turns, :max_retry_backoff_ms, :max_concurrent_agents_by_state],
+        [
+          :backend,
+          :default_effort,
+          :max_concurrent_agents,
+          :max_turns,
+          :max_retry_backoff_ms,
+          :max_concurrent_agents_by_state
+        ],
         empty_values: []
       )
       |> validate_inclusion(:backend, Enum.map(SymphonyElixir.AgentServer.backend_names(), &Atom.to_string/1))
+      |> validate_inclusion(:default_effort, SymphonyElixir.AgentRoute.effort_values())
       |> validate_number(:max_concurrent_agents, greater_than: 0)
       |> validate_number(:max_turns, greater_than: 0)
       |> validate_number(:max_retry_backoff_ms, greater_than: 0)
