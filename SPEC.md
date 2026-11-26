@@ -1630,6 +1630,10 @@ SHOULD return:
 - `codex_totals`
   - Compatibility alias for the aggregate agent totals during migration.
 - `rate_limits` (latest coding-agent rate limit payload, if available)
+  - Normalized to a `limit_id` plus `primary`/`secondary`/`credits` buckets, each bucket
+    carrying `remaining`/`limit` and an optional reset field. The Claude backend maps its
+    percentage windows (`five_hour`/`seven_day`/`spend_limit`) into this shape; the raw
+    windows remain in the event payload.
 
 RECOMMENDED snapshot error modes:
 

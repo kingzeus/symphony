@@ -753,9 +753,11 @@ defmodule SymphonyElixir.ClaudeCodeBackend do
     do: terminal_error
 
   defp handle_payload(%{"type" => "result"} = payload, raw, on_message, metadata, _result) do
+    rate_limits = claude_rate_limits(payload)
+
     cond do
       permission_denials(payload) != [] ->
-        handle_permission_denial(payload, raw, on_message, metadata)
+        handle_permission_denial(payload, raw, on_message, metadata, rate_limits)
 
       Map.get(payload, "is_error") == true or error_result_subtype?(Map.get(payload, "subtype")) ->
         error = provider_error(payload)
@@ -764,7 +766,7 @@ defmodule SymphonyElixir.ClaudeCodeBackend do
         emit(
           on_message,
           :turn_failed,
-          Map.merge(metadata, %{error: error, usage: usage, payload: payload, raw: raw})
+          Map.merge(metadata, %{error: error, usage: usage, rate_limits: rate_limits, payload: payload, raw: raw})
         )
 
         {:error, error}
@@ -777,7 +779,13 @@ defmodule SymphonyElixir.ClaudeCodeBackend do
             emit(
               on_message,
               :turn_completed,
-              Map.merge(metadata, %{session_id: provider_session_id, usage: usage, payload: payload, raw: raw})
+              Map.merge(metadata, %{
+                session_id: provider_session_id,
+                usage: usage,
+                rate_limits: rate_limits,
+                payload: payload,
+                raw: raw
+              })
             )
 
             {:ok, provider_session_id, usage, payload}
@@ -793,7 +801,13 @@ defmodule SymphonyElixir.ClaudeCodeBackend do
             emit(
               on_message,
               :malformed_protocol,
-              Map.merge(metadata, %{error: error, usage: claude_failure_usage(payload, metadata), payload: payload, raw: raw})
+              Map.merge(metadata, %{
+                error: error,
+                usage: claude_failure_usage(payload, metadata),
+                rate_limits: rate_limits,
+                payload: payload,
+                raw: raw
+              })
             )
 
             {:error, error}
@@ -830,7 +844,7 @@ defmodule SymphonyElixir.ClaudeCodeBackend do
     result
   end
 
-  defp handle_permission_denial(payload, raw, on_message, metadata) do
+  defp handle_permission_denial(payload, raw, on_message, metadata, rate_limits) do
     denials = permission_denials(payload)
 
     approval =
@@ -853,7 +867,14 @@ defmodule SymphonyElixir.ClaudeCodeBackend do
     emit(
       on_message,
       :approval_required,
-      Map.merge(metadata, %{approval: approval, error: error, usage: usage, payload: payload, raw: raw})
+      Map.merge(metadata, %{
+        approval: approval,
+        error: error,
+        usage: usage,
+        rate_limits: rate_limits,
+        payload: payload,
+        raw: raw
+      })
     )
 
     {:error, error}
@@ -915,6 +936,60 @@ defmodule SymphonyElixir.ClaudeCodeBackend do
 
     claude_usage(payload, session_id, metadata.turn_id)
   end
+
+  # Claude reports subscription/gateway limits as percentage windows
+  # (five_hour/seven_day/spend_limit); normalize them into the remaining/limit
+  # bucket shape the orchestrator and dashboard already render for Codex. The
+  # raw windows stay untouched in the event payload.
+  defp claude_rate_limits(payload) when is_map(payload) do
+    case Map.get(payload, "rate_limits") do
+      %{} = windows when map_size(windows) > 0 ->
+        now = System.system_time(:second)
+
+        %{
+          "limit_id" => "claude",
+          "primary" => claude_window_bucket(Map.get(windows, "five_hour"), now),
+          "secondary" => claude_window_bucket(Map.get(windows, "seven_day"), now),
+          "credits" => claude_spend_credits(Map.get(windows, "spend_limit"))
+        }
+
+      _ ->
+        nil
+    end
+  end
+
+  defp claude_window_bucket(%{} = window, now) do
+    bucket =
+      case Map.get(window, "used_percentage") do
+        used when is_number(used) ->
+          %{"remaining" => max(0, round(100 - used)), "limit" => 100}
+
+        _ ->
+          %{}
+      end
+
+    case Map.get(window, "resets_at") do
+      resets_at when is_number(resets_at) ->
+        Map.put(bucket, "reset_in_seconds", max(0, round(resets_at - now)))
+
+      _ ->
+        bucket
+    end
+  end
+
+  defp claude_window_bucket(_window, _now), do: nil
+
+  defp claude_spend_credits(%{} = spend) do
+    limit_usd = Map.get(spend, "limit_usd")
+    used_usd = Map.get(spend, "used_usd")
+
+    if is_number(limit_usd) and is_number(used_usd) do
+      balance = max(0, limit_usd - used_usd)
+      %{"has_credits" => balance > 0, "unlimited" => false, "balance" => balance}
+    end
+  end
+
+  defp claude_spend_credits(_spend), do: nil
 
   defp valid_provider_session_id(payload) do
     case Map.get(payload, "session_id") do
@@ -984,6 +1059,7 @@ defmodule SymphonyElixir.ClaudeCodeBackend do
         usage: Map.get(attrs, :usage),
         error: Map.get(attrs, :error),
         approval: Map.get(attrs, :approval),
+        rate_limits: Map.get(attrs, :rate_limits),
         payload: Map.get(attrs, :payload),
         raw: Map.get(attrs, :raw),
         worker_host: Map.get(attrs, :worker_host)

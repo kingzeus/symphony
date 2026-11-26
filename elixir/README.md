@@ -219,6 +219,11 @@ Notes:
   silence timeout, failure reason), the session identifier on session startup, and
   provider-reported usage counts. They never include tool arguments, raw protocol frames, prompts,
   MCP configuration, or credentials, and the orchestrator does not depend on those strings.
+- Claude result events may carry subscription/gateway `rate_limits` as percentage windows
+  (`five_hour`, `seven_day`, `spend_limit`). Symphony normalizes these into the same
+  `limit_id`/`primary`/`secondary`/`credits` bucket shape used for Codex so the dashboard and rate
+  limit warnings render them; the raw windows stay in the event payload. The field is optional and
+  only present for subscribers or behind a gateway that reports a spend limit.
 - Local Claude cleanup sends `TERM` and then `KILL` to the discovered process tree. It uses
   `pgrep -P` when available, falls back to a `ps` PID/PPID table, and still attempts the direct Port
   PID when neither descendant-discovery tool exists. The SSH launch trap uses the same discovery

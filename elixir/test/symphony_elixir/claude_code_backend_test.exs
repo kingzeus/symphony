@@ -554,6 +554,171 @@ defmodule SymphonyElixir.ClaudeCodeBackendTest do
     assert_received {:event, %Event{type: :turn_completed}}
   end
 
+  test "result 事件的 rate_limits 被规范化为看板桶形状", context do
+    now = System.system_time(:second)
+    five_hour_reset = now + 3600
+    seven_day_reset = now + 86_400
+
+    result_payload = %{
+      "type" => "result",
+      "subtype" => "success",
+      "session_id" => @provider_session_1,
+      "usage" => %{"input_tokens" => 1, "output_tokens" => 1},
+      "rate_limits" => %{
+        "five_hour" => %{"used_percentage" => 20, "resets_at" => five_hour_reset},
+        "seven_day" => %{"used_percentage" => 55.2, "resets_at" => seven_day_reset},
+        "spend_limit" => %{
+          "used_percentage" => 10,
+          "resets_at" => five_hour_reset,
+          "limit_usd" => 100.0,
+          "used_usd" => 40.0
+        }
+      }
+    }
+
+    line = Jason.encode!(result_payload)
+
+    fake =
+      install_fake_claude!(
+        context.test_root,
+        "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '#{line}'\n",
+        "rate-limits"
+      )
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: context.workspace_root,
+      agent_backend: "claude_code",
+      claude_code_command: fake
+    )
+
+    {:ok, session} = ClaudeCodeBackend.start_session(context.workspace)
+    test_pid = self()
+
+    assert {:ok, _result} =
+             ClaudeCodeBackend.run_turn(session, "limits", context.issue, on_message: &send(test_pid, {:event, &1}))
+
+    assert_received {:event, %Event{type: :turn_completed, rate_limits: rate_limits, payload: payload}}
+
+    assert rate_limits["limit_id"] == "claude"
+    assert rate_limits["primary"]["remaining"] == 80
+    assert rate_limits["primary"]["limit"] == 100
+    assert rate_limits["secondary"]["remaining"] == 45
+    assert rate_limits["secondary"]["limit"] == 100
+    assert rate_limits["credits"] == %{"has_credits" => true, "unlimited" => false, "balance" => 60.0}
+
+    after_now = System.system_time(:second)
+    assert rate_limits["primary"]["reset_in_seconds"] in (five_hour_reset - after_now)..(five_hour_reset - now)
+    assert rate_limits["secondary"]["reset_in_seconds"] in (seven_day_reset - after_now)..(seven_day_reset - now)
+
+    # Raw windows remain lossless in the payload.
+    assert payload["rate_limits"]["five_hour"]["used_percentage"] == 20
+  end
+
+  test "result 无 rate_limits 时事件 rate_limits 为 nil", context do
+    fake =
+      install_fake_claude!(
+        context.test_root,
+        """
+        #!/bin/sh
+        cat >/dev/null
+        printf '%s\\n' '{"type":"result","subtype":"success","session_id":"#{@provider_session_1}","usage":{"input_tokens":1,"output_tokens":1}}'
+        """,
+        "no-rate-limits"
+      )
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: context.workspace_root,
+      agent_backend: "claude_code",
+      claude_code_command: fake
+    )
+
+    {:ok, session} = ClaudeCodeBackend.start_session(context.workspace)
+    test_pid = self()
+
+    assert {:ok, _result} =
+             ClaudeCodeBackend.run_turn(session, "no limits", context.issue, on_message: &send(test_pid, {:event, &1}))
+
+    assert_received {:event, %Event{type: :turn_completed, rate_limits: nil}}
+  end
+
+  test "rate_limits 仅含部分窗口时缺失项降级为 nil", context do
+    line =
+      Jason.encode!(%{
+        "type" => "result",
+        "subtype" => "success",
+        "session_id" => @provider_session_1,
+        "usage" => %{"input_tokens" => 1, "output_tokens" => 1},
+        "rate_limits" => %{"five_hour" => %{"used_percentage" => 30}}
+      })
+
+    fake =
+      install_fake_claude!(
+        context.test_root,
+        "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '#{line}'\n",
+        "partial-windows"
+      )
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: context.workspace_root,
+      agent_backend: "claude_code",
+      claude_code_command: fake
+    )
+
+    {:ok, session} = ClaudeCodeBackend.start_session(context.workspace)
+    test_pid = self()
+
+    assert {:ok, _result} =
+             ClaudeCodeBackend.run_turn(session, "partial", context.issue, on_message: &send(test_pid, {:event, &1}))
+
+    assert_received {:event, %Event{type: :turn_completed, rate_limits: rate_limits}}
+
+    assert rate_limits["primary"] == %{"remaining" => 70, "limit" => 100}
+    assert rate_limits["secondary"] == nil
+    assert rate_limits["credits"] == nil
+  end
+
+  test "rate_limits 窗口缺百分比或 spend 缺金额时安全降级", context do
+    now = System.system_time(:second)
+
+    line =
+      Jason.encode!(%{
+        "type" => "result",
+        "subtype" => "success",
+        "session_id" => @provider_session_1,
+        "usage" => %{"input_tokens" => 1, "output_tokens" => 1},
+        "rate_limits" => %{
+          "seven_day" => %{"resets_at" => now + 60},
+          "spend_limit" => %{"used_percentage" => 50}
+        }
+      })
+
+    fake =
+      install_fake_claude!(
+        context.test_root,
+        "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '#{line}'\n",
+        "missing-fields"
+      )
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: context.workspace_root,
+      agent_backend: "claude_code",
+      claude_code_command: fake
+    )
+
+    {:ok, session} = ClaudeCodeBackend.start_session(context.workspace)
+    test_pid = self()
+
+    assert {:ok, _result} =
+             ClaudeCodeBackend.run_turn(session, "missing fields", context.issue, on_message: &send(test_pid, {:event, &1}))
+
+    assert_received {:event, %Event{type: :turn_completed, rate_limits: rate_limits}}
+
+    assert rate_limits["primary"] == nil
+    assert Map.has_key?(rate_limits["secondary"], "reset_in_seconds")
+    refute Map.has_key?(rate_limits["secondary"], "remaining")
+    assert rate_limits["credits"] == nil
+  end
+
   test "stderr 不进入 stream-json parser", context do
     fake =
       install_fake_claude!(
