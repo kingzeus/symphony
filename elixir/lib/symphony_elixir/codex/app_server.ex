@@ -285,8 +285,13 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp apply_effort(command, nil), do: command
 
   defp apply_effort(command, effort) when is_binary(effort) do
-    if command =~ ~r/model_reasoning_effort\s*=\s*\S+/ do
-      Regex.replace(~r/(model_reasoning_effort\s*=\s*)\S+/, command, "\\1#{effort}")
+    # Word boundary avoids matching xmodel_reasoning_effort; the value alternative
+    # requires a quoted string or immediate non-whitespace so an empty value
+    # (`model_reasoning_effort= app-server`) cannot swallow the subcommand.
+    pattern = ~r/\bmodel_reasoning_effort=("[^"]*"|'[^']*'|\S+)/
+
+    if command =~ pattern do
+      Regex.replace(pattern, command, "model_reasoning_effort=#{effort}")
     else
       command <> " -c model_reasoning_effort=#{effort}"
     end

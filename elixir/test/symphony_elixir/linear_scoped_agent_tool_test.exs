@@ -616,6 +616,8 @@ defmodule SymphonyElixir.Linear.ScopedAgentToolTest do
 
     File.write!(Path.join(workspace, "empty.md"), "")
     File.write!(Path.join(workspace, "bad-header.md"), "ordinary text")
+    File.write!(Path.join(workspace, "huge.md"), "## Codex Workpad\n" <> String.duplicate("x", 200_001))
+    File.mkdir_p!(Path.join(workspace, "dir.md"))
     File.write!(Path.join(outside, "secret.md"), "## Codex Workpad\noutside")
     File.ln_s!(Path.join(outside, "secret.md"), Path.join(workspace, "escape.md"))
 
@@ -628,6 +630,8 @@ defmodule SymphonyElixir.Linear.ScopedAgentToolTest do
       {%{"file_path" => "missing.md"}, workspace},
       {%{"file_path" => "empty.md"}, workspace},
       {%{"file_path" => "bad-header.md"}, workspace},
+      {%{"file_path" => "huge.md"}, workspace},
+      {%{"file_path" => "dir.md"}, workspace},
       {%{"file_path" => "workpad.md", "body" => "## Codex Workpad\ninline"}, workspace},
       {%{"file_path" => "workpad.md"}, nil},
       {%{"file_path" => String.duplicate("a", 300)}, workspace}

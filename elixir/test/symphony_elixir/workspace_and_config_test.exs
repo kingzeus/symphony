@@ -1265,6 +1265,16 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
              ]
            }
 
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: explicit_root,
+      codex_turn_sandbox_policy: %{type: "workspaceWrite", writableRoots: "/tmp/not-a-list"}
+    )
+
+    assert Config.codex_turn_sandbox_policy(explicit_workspace) == %{
+             "type" => "workspaceWrite",
+             "writableRoots" => "/tmp/not-a-list"
+           }
+
     write_workflow_file!(Workflow.workflow_file_path(), tracker_active_states: ",")
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
     assert message =~ "tracker.active_states"

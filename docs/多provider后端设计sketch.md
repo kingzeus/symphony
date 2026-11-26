@@ -234,3 +234,8 @@ Qoder headless 接口与 Claude Code **近乎 1:1**,适合走 StreamJsonCore dia
 - **接口漂移**:Qoder CLI 演进可能改 flag/事件;版本门 + 实证清单缓解。
 - **门禁**:每项独立提交,make all(100% 覆盖率)真实退出码验证(见项目记忆「门禁退出码不能被管道掩盖」)。
 - **dialect 参数化 contingent**:StreamJsonCore 的 Dialect 抽象以 §8 实证校准;若 Qoder 事件方言差异大,核需容纳变体而非硬套。
+
+### 已知技术债(review 识别,非阻塞)
+
+- **编排重复(m5)**:Claude/Qoder 两 dialect 的 AgentServer 编排(start_session/run_turn/run_prepared_turn/workspace 守卫/flag helpers)~250 行逐字重复。第三个 provider 进来前应把编排下沉 StreamJsonCore(或共享 `__using__`),dialect 只留 cli_args + 回调。
+- **file_path TOCTOU(m4)**:workpad 文件 canonicalize→stat→read 之间存在极窄 symlink 替换窗口;影响有限(内容只发到 agent 自己 issue 的 comment),静态逃逸(绝对/`..`/symlink)已 fail-closed 并有测试。接受该风险;如需硬化可改 fd 级复核。

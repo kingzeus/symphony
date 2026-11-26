@@ -393,7 +393,7 @@ defmodule SymphonyElixirWeb.Presenter do
   defp last_codex_update_message(entry) do
     message = Map.get(entry, :last_agent_message) || Map.get(entry, :last_codex_message)
 
-    if is_map(message) and Map.get(message, :backend) == :claude_code do
+    if is_map(message) and Map.get(message, :backend) in [:claude_code, :qoder] do
       Map.get(message, :message, message)
     else
       message

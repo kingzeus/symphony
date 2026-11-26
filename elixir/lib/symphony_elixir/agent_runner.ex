@@ -116,7 +116,7 @@ defmodule SymphonyElixir.AgentRunner do
       opts
       |> Keyword.get(:backend_start_opts, [])
       |> Keyword.put(:worker_host, worker_host)
-      |> Keyword.put(:effort, Keyword.get(opts, :effort))
+      |> put_effort(Keyword.get(opts, :effort))
 
     case start_backend_session(backend_module, workspace, start_opts) do
       {:ok, session} ->
@@ -151,6 +151,9 @@ defmodule SymphonyElixir.AgentRunner do
         {:error, error}
     end
   end
+
+  defp put_effort(start_opts, nil), do: start_opts
+  defp put_effort(start_opts, effort), do: Keyword.put(start_opts, :effort, effort)
 
   defp start_backend_session(backend_module, workspace, start_opts) do
     backend_module.start_session(workspace, start_opts)

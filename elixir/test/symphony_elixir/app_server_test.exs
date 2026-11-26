@@ -1941,6 +1941,32 @@ defmodule SymphonyElixir.AppServerTest do
     assert wait_for_file(capture)
     assert File.read!(capture) =~ "-c"
     assert File.read!(capture) =~ "model_reasoning_effort=medium"
+
+    File.rm!(capture)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      codex_command: "#{fake} app-server -c model_reasoning_effort="
+    )
+
+    _ = AppServer.start_session(workspace, effort: "high")
+    assert wait_for_file(capture)
+    empty_value_argv = File.read!(capture)
+    assert empty_value_argv =~ "app-server"
+    assert empty_value_argv =~ "model_reasoning_effort=high"
+
+    File.rm!(capture)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      codex_command: "#{fake} app-server -c xmodel_reasoning_effort=low"
+    )
+
+    _ = AppServer.start_session(workspace, effort: "high")
+    assert wait_for_file(capture)
+    boundary_argv = File.read!(capture)
+    assert boundary_argv =~ "xmodel_reasoning_effort=low"
+    assert boundary_argv =~ "model_reasoning_effort=high"
   end
 
   defp wait_for_file(path, attempts \\ 100)

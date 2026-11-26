@@ -8,8 +8,8 @@ defmodule SymphonyElixir.QoderBackend do
   flags (kebab-case tools, snake_case permission modes, no `--verbose`),
   the `QODER_AGENT_SDK_ENTRYPOINT` nesting marker, and naming.
 
-  Minimal closed loop (P3): spawn → stream-json → result → resume. Restricted
-  Linear MCP injection is added in P4.
+  Spawn → stream-json → result → resume, with restricted Linear MCP injection
+  via the shared `StreamJsonCore.TrackerMcp` (same bridge as Claude Code).
   """
 
   @behaviour SymphonyElixir.AgentServer
@@ -33,7 +33,8 @@ defmodule SymphonyElixir.QoderBackend do
           worker_host: String.t() | nil,
           turn_count: non_neg_integer(),
           runtime_settings: map(),
-          tracker_binding: map()
+          tracker_binding: map(),
+          effort: String.t() | nil
         }
 
   @impl SymphonyElixir.AgentServer

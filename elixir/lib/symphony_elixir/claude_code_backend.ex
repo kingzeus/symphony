@@ -28,7 +28,8 @@ defmodule SymphonyElixir.ClaudeCodeBackend do
           worker_host: String.t() | nil,
           turn_count: non_neg_integer(),
           runtime_settings: Config.claude_code_runtime_settings(),
-          tracker_binding: map()
+          tracker_binding: map(),
+          effort: String.t() | nil
         }
 
   @impl SymphonyElixir.AgentServer

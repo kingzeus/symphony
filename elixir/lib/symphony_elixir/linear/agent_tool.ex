@@ -360,12 +360,32 @@ defmodule SymphonyElixir.Linear.AgentTool do
 
   defp read_descendant_file(canonical_file, canonical_workspace) do
     if descendant_path?(canonical_file, canonical_workspace) do
-      case File.read(canonical_file) do
-        {:ok, body} -> {:ok, body}
-        {:error, reason} -> {:error, {:workpad_file_read, reason}}
-      end
+      read_sized_file(canonical_file)
     else
       {:error, :workpad_file_outside_workspace}
+    end
+  end
+
+  # Stat before read so an oversized agent-created file is rejected without
+  # being loaded into the host BEAM (the inline body path has an MCP maxLength
+  # guard; the file path needs an equivalent pre-check).
+  defp read_sized_file(canonical_file) do
+    case File.stat(canonical_file) do
+      {:ok, %File.Stat{size: size}} when size <= @max_workpad_body_bytes ->
+        read_file_body(canonical_file)
+
+      {:ok, _stat} ->
+        {:error, :workpad_body_too_large}
+
+      {:error, reason} ->
+        {:error, {:workpad_file_read, reason}}
+    end
+  end
+
+  defp read_file_body(canonical_file) do
+    case File.read(canonical_file) do
+      {:ok, body} -> {:ok, body}
+      {:error, reason} -> {:error, {:workpad_file_read, reason}}
     end
   end
 

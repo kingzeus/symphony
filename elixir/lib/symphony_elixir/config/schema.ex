@@ -725,12 +725,15 @@ defmodule SymphonyElixir.Config.Schema do
   defp with_git_writable_root(%{"type" => "workspaceWrite"} = policy, workspace)
        when is_binary(workspace) and workspace != "" do
     git_root = Path.join(workspace, ".git")
-    roots = Map.get(policy, "writableRoots", [])
 
-    if git_root in roots do
-      policy
-    else
-      Map.put(policy, "writableRoots", roots ++ [git_root])
+    case Map.get(policy, "writableRoots", []) do
+      roots when is_list(roots) ->
+        if git_root in roots, do: policy, else: Map.put(policy, "writableRoots", roots ++ [git_root])
+
+      # Non-list writableRoots is malformed; pass through unchanged so Codex
+      # rejects it at turn/start rather than crashing policy resolution here.
+      _ ->
+        policy
     end
   end
 

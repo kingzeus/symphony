@@ -1079,7 +1079,7 @@ defmodule SymphonyElixir.StatusDashboard do
   end
 
   defp claude_code_message?(message) when is_map(message) do
-    Map.get(message, :backend) == :claude_code or Map.get(message, "backend") == :claude_code
+    Map.get(message, :backend) in [:claude_code, :qoder] or Map.get(message, "backend") in [:claude_code, :qoder]
   end
 
   defp claude_code_message?(_message), do: false
