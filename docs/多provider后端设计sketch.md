@@ -190,28 +190,30 @@ Qoder headless 接口与 Claude Code **近乎 1:1**,适合走 StreamJsonCore dia
 | 工具白/黑名单 | `--allowedTools`/`--disallowedTools` | `--allowed-tools`/`--disallowed-tools` | flag 名 kebab,需核对 |
 | 模型 | `--model` | `--model auto\|lite\|performance\|BYOK` | ✓ |
 | 续会话 | `--resume`/`--session-id` | `--resume [id]`/`--session-id`/`--continue` | ✓ |
-| 轮数上限 | (opts) | `--max-turns` | ✓ |
+| 轮数上限 | (opts) | **无 `--max-turns`**(1.1.98);有 `--max-output-tokens` | ✗ dialect 去掉 |
 | 推理强度 | (codex 有) | `--reasoning-effort high` | Qoder 特有 |
 | 配置目录 | `CLAUDE_CONFIG_DIR` | `--config-dir`(默认 `~/.qoder`) | per-task 隔离 |
 | 原生指令文件 | `CLAUDE.md` | **`AGENTS.md`** | 注入 WORKFLOW 合同 |
 | 鉴权 | `ANTHROPIC_API_KEY` | `QODER_PERSONAL_ACCESS_TOKEN` | 密钥剥离名单加此项 |
 | ACP | — | `--acp`(stdio ACP server) | 备选协议,首批不用 |
 
-**权限值映射**(Qoder snake_case vs Claude camelCase):default↔default、acceptEdits↔`accept_edits`、plan↔plan、auto↔auto、dontAsk↔`dont_ask`、bypassPermissions↔`bypass_permissions`。无人值守默认沿用 P0-2:`auto`;`bypass_permissions` 仅限强隔离 worker。Qoder plain-text headless 需确认操作默认拒绝;stream-json Host 驱动转发审批(Agent SDK)→ 复用 `:approval_required` blocked 语义。
+**权限值映射**(Qoder snake_case vs Claude camelCase):default↔default、acceptEdits↔`accept_edits`、auto↔auto、dontAsk↔`dont_ask`、bypassPermissions↔`bypass_permissions`。**Qoder 无 plan 模式**。无人值守默认沿用 P0-2:`auto`;`bypass_permissions` 仅限强隔离 worker。Qoder plain-text headless 需确认操作默认拒绝;stream-json Host 驱动转发审批(Agent SDK)→ 复用 `:approval_required` blocked 语义。
 
 受限 Linear MCP(P1-2 的 `tracker_issue_get`/`tracker_workpad_upsert`/`tracker_issue_transition`)经 `--mcp-config` 注入 Qoder 会话,capability/workspace 穿透共用同一 MCP bridge(名字届时泛化为 `TrackerMCP`)。tracker 后端合同零改动。
 
-## 8. 实证验证清单(实现前必做,参考实现先实证再吸收)
+## 8. 实证验证清单(参考实现先实证再吸收)
 
-本机 `qodercli` 二进制未在预期路径找到(`~/.local/bin`、`~/.qoder/bin/qodercli/` 均无,尽管 git hook 声称已装)——**先确认安装/定位**。其余:
+已 `npm install -g @qoder-ai/qodercli`(1.1.98)并实跑 `qodercli -p ... --output-format stream-json` 核对(需 unset nesting marker `QODER_AGENT_SDK_ENTRYPOINT`,否则报 `sdk_worker_removed`):
 
-- [ ] Qoder stream-json **事件类型与 result 字段**:`session_id`/`usage`/`is_error`/`subtype`/`permission_denials` 是否与 Claude 同名同形(决定 dialect 参数化是否够用,还是需核变体)。
-- [ ] `--verbose` / `--include-partial-messages` 是否存在。
-- [ ] `--allowed-tools` vs `--allowedTools` 接受度;工具规则语法 `Bash(git:*)` 一致性。
-- [ ] stream-json Host 驱动审批转发形状,能否复用 `permission_denials` → `:approval_required`。
-- [ ] 原生 skills 目录(`.qoder/skills`?)与指令文件(AGENTS.md 已确认)。
-- [ ] `--resume`/`--session-id` 行为与 session_id 格式。
-- [ ] `QODER_PERSONAL_ACCESS_TOKEN` 鉴权 + 密钥剥离。
+- [x] **事件/result 与 Claude 同构**(关键结论):`result`{subtype:"success", is_error, session_id(UUID), usage{input_tokens/output_tokens/cache_creation_input_tokens/cache_read_input_tokens}, permission_denials[]}、`assistant`{message.content[].type text/tool_use, message.usage}、`system`/init 全匹配 Claude 形状 → **payload 解释可复用**,dialect 只需改 flag/marker/display_name。Qoder 额外字段 total_credits/modelUsage/context_usage_ratio 不影响核心提取;system 子类型 artifacts_update/hook_diagnostics 走 notification fallback。
+- [x] **无 `--verbose` / `--include-partial-messages` / `--max-turns`**(1.1.98);有 `--max-output-tokens`/`--max-model-request-retries`/`--thinking`/`--thinking-budget`/`--context-window`/`--worktree`。dialect cli_args 须去掉 Claude 的 verbose/partial。
+- [x] `--allowed-tools`/`--disallowed-tools` kebab(Claude 是 `--allowedTools` camel);`--tools` 限制内置工具。
+- [x] permission-mode 取值 `default/accept_edits/bypass_permissions/dont_ask/auto`(**无 plan**);flag snake_case,但 init 事件里 permissionMode 回显 camelCase(dontAsk)。
+- [x] session_id UUID 格式,`--resume [id]`/`--session-id`/`--continue`/`--fork-session` 齐。
+- [x] nesting marker = `QODER_AGENT_SDK_ENTRYPOINT`(检测即 throw sdk_worker_removed);dialect nested_marker_names 用此。
+- [x] 鉴权:`~/.qoder/.auth/user` 存在即可跑(apiKeySource:none 仍成功);`QODER_PERSONAL_ACCESS_TOKEN` 为 CI 路径。
+- [ ] 原生 skills 目录(`.qoder/skills`?)待核;指令文件 AGENTS.md 已确认。
+- [ ] Qoder subscription rate_limits 形状( trivial run 无 rate_limits 字段;claude_rate_limits 缺省 nil 安全)。
 - [ ] Qoder CLI 最低版本门(借 Multica `CheckMinVersion`,防接口漂移)。
 
 ## 9. 分期落地(通用层先行)
