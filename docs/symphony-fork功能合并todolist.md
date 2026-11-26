@@ -31,6 +31,11 @@
 
 ### P0-2 sandbox 默认值对照检查
 
+> 已完成:`7e048cc`(2026-11-26)。与参考偏差:参考切 `dangerFullAccess` 全放开;
+> 本 fork 默认本地 worker,改为保沙箱——`workspaceWrite` 策略注入 `<workspace>/.git`
+> 到 writableRoots(codex 0.172.0 实证 commit/push 全通、沙箱边界保留)。Claude 侧
+> `permission_mode: auto`(分类器审查,依赖模型/代理支持)。
+
 - **来源**:odysseus0/symphony `d90560a3`(+16/-11,只动 WORKFLOW.md)。
 - **问题**:上游默认 sandbox 挡 `.git/` 写入,git+PR 流程静默断裂。
 - **做什么**:对照本 fork WORKFLOW.md 与 Claude 后端的实际权限配置,确认 `.git/` 可写;有挡则修。
