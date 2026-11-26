@@ -221,7 +221,7 @@ Qoder headless 接口与 Claude Code **近乎 1:1**,适合走 StreamJsonCore dia
 - **P0**:本 sketch 评审定方向(深度+共享核、三层、迁移序)。
 - **P1**:注册表数据驱动泛化 + config 校验派生(§6),codex/claude_code 行为零改动,make all 绿。**已落地**。provider 元数据回调(`api_key_env`/`tool_specs`/`provider_config`)延到 P3 随 Qoder 引入——避免无消费者的投机抽象;注册表泛化已是合同增量的具体抓手。
 - **P2**:Layer 2 抽 StreamJsonCore,ClaudeCodeBackend 迁为 dialect(行为保持重构,§5 迁移 B)。**一次性成本**——通用层地基,此后同族 provider 复用。**已落地**:StreamJsonCore(含 Dialect behaviour)843 行,ClaudeCodeBackend 1424→690 行;provider 文案走 `dialect.display_name()` 保留原值(stderr 日志/错误文案测试断言精确文本);公开函数(process_tree_command/port_process_id/stop_port/close_port)留薄委托器;Claude 54 测试 + 全模块 100% 覆盖绿。
-- **P3**:QoderProvider dialect 最短闭环(spawn→stream-json→result→resume),§8 实证先行。Qoder 是首个吃 P2 红利的 provider。
+- **P3**:QoderProvider dialect 最短闭环(spawn→stream-json→result→resume),§8 实证先行。**已落地**:QoderBackend 实现 AgentServer+Dialect,复用 StreamJsonCore+共享 Payload(新增 `StreamJsonCore.Payload` 把 Claude 兼容事件解释抽共享,Claude/Qoder 共用,usage identity tag/rate_limits 走 dialect 回调);Qoder config schema(snake_case permission 无 plan、reasoning_effort、无 include_partial);注册表 :qoder;Event 类型/guard 扩展。16 测试全过,全模块 100% 覆盖。Qoder 是首个吃 P2 红利的 provider——dialect 仅 flag/marker/命名,payload 零重写。
 - **P4**:Qoder 深度对齐(受限 MCP merge、密钥剥离、进程树、rate_limits、SSH remote)。
 - **后续 provider(边际成本)**:stream-json 族只加 dialect + 注册 + config(纯 Layer 3),复用核,不推倒重来;异协议才往 Layer 2 加核。
 
