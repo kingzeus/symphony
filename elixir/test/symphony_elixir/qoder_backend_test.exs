@@ -286,6 +286,82 @@ defmodule SymphonyElixir.QoderBackendTest do
     assert QoderBackend.stop_session(%{}) == :ok
   end
 
+  test "本地 Qoder turn 自动注入宿主机 Tracker MCP、精确放行工具并撤销 capability", context do
+    trace = Path.join(context.test_root, "tracker-mcp.trace")
+
+    fake =
+      install_fake_qoder!(
+        context.test_root,
+        """
+        #!/bin/sh
+        printf 'ARGV:' > #{shell_literal(trace)}
+        previous=''
+        mcp_path=''
+        for arg in "$@"; do
+          printf '%s|' "$arg" >> #{shell_literal(trace)}
+          [ "$previous" = '--mcp-config' ] && mcp_path="$arg"
+          previous="$arg"
+        done
+        printf '\\n' >> #{shell_literal(trace)}
+        cat "$mcp_path" > #{shell_literal(trace <> ".mcp")}
+        cat >/dev/null
+        printf '%s\\n' '{"type":"result","session_id":"#{@provider_session_1}","usage":{"input_tokens":1,"output_tokens":1}}'
+        """,
+        "tracker-mcp"
+      )
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: context.workspace_root,
+      agent_backend: "qoder",
+      qoder_command: fake,
+      qoder_allowed_tools: ["Bash(pwd)"],
+      qoder_mcp_config: %{
+        "mcpServers" => %{"private" => %{"command" => "private-server"}}
+      },
+      server_port: 45_678,
+      server_host: "0.0.0.0"
+    )
+
+    {:ok, session} = QoderBackend.start_session(context.workspace)
+    assert {:ok, _result} = QoderBackend.run_turn(session, "tracker", context.issue)
+
+    argv = File.read!(trace)
+    assert argv =~ "--allowed-tools|Bash(pwd)"
+    assert argv =~ "--allowed-tools|mcp__symphony_tracker__tracker_issue_get"
+    assert argv =~ "--allowed-tools|mcp__symphony_tracker__tracker_workpad_upsert"
+    assert argv =~ "--allowed-tools|mcp__symphony_tracker__tracker_issue_transition"
+    refute argv =~ "mcp__symphony_tracker__linear_graphql"
+
+    config = (trace <> ".mcp") |> File.read!() |> Jason.decode!()
+    assert get_in(config, ["mcpServers", "private", "command"]) == "private-server"
+
+    tracker_server = get_in(config, ["mcpServers", "symphony_tracker"])
+    assert tracker_server["type"] == "http"
+    assert tracker_server["url"] == "http://127.0.0.1:45678/api/v1/agent-mcp"
+    assert "Bearer " <> token = get_in(tracker_server, ["headers", "Authorization"])
+    assert {:error, :unauthorized} = SymphonyElixir.ClaudeTrackerMCP.lookup(token)
+  end
+
+  test "无效自动 Tracker MCP 配置返回 typed startup error", context do
+    fake = install_fake_qoder!(context.test_root, "#!/bin/sh\nexit 99\n", "invalid-tracker-mcp")
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: context.workspace_root,
+      agent_backend: "qoder",
+      qoder_command: fake,
+      qoder_mcp_config: %{"mcpServers" => "invalid"},
+      server_port: 45_680
+    )
+
+    {:ok, session} = QoderBackend.start_session(context.workspace)
+    test_pid = self()
+
+    assert {:error, %Error{kind: :startup, raw: :invalid_claude_mcp_servers}} =
+             QoderBackend.run_turn(session, "invalid tracker", context.issue, on_message: &send(test_pid, {:qoder_event, &1}))
+
+    assert_received {:qoder_event, %Event{type: :startup_failed, error: %Error{raw: :invalid_claude_mcp_servers}}}
+  end
+
   test "bash 不可用时 start_port 失败映射 startup_failed", context do
     previous_path = System.get_env("PATH")
     fake_bin = Path.join(context.test_root, "empty-bin")

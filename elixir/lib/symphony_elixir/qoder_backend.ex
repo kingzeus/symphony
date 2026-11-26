@@ -105,7 +105,19 @@ defmodule SymphonyElixir.QoderBackend do
 
     Logger.info("Qoder turn starting for #{issue_context(issue)} session_id=#{current_session_id} turn_id=#{turn_id} worker_host=#{worker_host_for_log(session.worker_host)}")
 
-    run_prepared_turn(session, prompt, issue, on_message, base, settings)
+    case StreamJsonCore.TrackerMcp.prepare(session, issue, settings, current_session_id, turn_id) do
+      {:ok, turn_settings, tracker_mcp_token} ->
+        try do
+          run_prepared_turn(session, prompt, issue, on_message, base, turn_settings)
+        after
+          StreamJsonCore.TrackerMcp.close(tracker_mcp_token)
+        end
+
+      {:error, reason} ->
+        error = AgentServer.normalize_error(reason, :startup)
+        emit(on_message, :startup_failed, Map.merge(base, %{error: error, payload: reason}))
+        {:error, error}
+    end
   end
 
   defp run_prepared_turn(session, prompt, issue, on_message, base, settings) do

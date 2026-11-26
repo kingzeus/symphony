@@ -579,8 +579,11 @@ Fields:
 - `allowed_tools` / `disallowed_tools` (list of strings)
   - Default: `[]`. Passed as repeated `--allowed-tools` / `--disallowed-tools` (kebab-case) options.
 - `mcp_config` (string or object or null)
-  - Passed to Qoder CLI's `--mcp-config`; objects are JSON encoded. Restricted Tracker MCP injection
-    is added in a later phase (P4); string/path values remain explicit pass-through.
+  - Passed to Qoder CLI's `--mcp-config`; objects are JSON encoded.
+  - For local workers with the Symphony HTTP server enabled, null/object/inline-object values MAY be
+    merged with a host-managed Tracker MCP entry backed by the selected adapter's issue-scoped tools
+    (shared `StreamJsonCore.TrackerMcp` injection, same as Claude Code). String/path values remain
+    explicit pass-through; remote workers require an explicitly reachable MCP server.
 - `reasoning_effort` (string or null)
   - Default: omitted. Passed as `--reasoning-effort` when set.
 - `turn_timeout_ms` (positive integer)
