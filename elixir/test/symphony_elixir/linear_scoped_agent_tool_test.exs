@@ -569,10 +569,89 @@ defmodule SymphonyElixir.Linear.ScopedAgentToolTest do
     refute "linear_graphql" in output["error"]["supportedTools"]
   end
 
+  test "tracker_workpad_upsert reads the body from a workspace file" do
+    workspace = Path.join(System.tmp_dir!(), "symphony-workpad-file-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(workspace)
+    on_exit(fn -> File.rm_rf(workspace) end)
+    File.write!(Path.join(workspace, "workpad.md"), "## Codex Workpad\n\nfrom file")
+
+    test_pid = self()
+
+    response =
+      scoped_call_file(%{"file_path" => "workpad.md"}, workspace, fn query, variables, _opts ->
+        send(test_pid, {:request, query, variables})
+
+        cond do
+          query =~ "SymphonyScopedWorkpadContext" ->
+            {:ok, %{"data" => %{"issue" => %{"id" => "issue-1", "comments" => %{"nodes" => []}}}}}
+
+          query =~ "SymphonyScopedWorkpadCreate" ->
+            {:ok,
+             %{
+               "data" => %{
+                 "commentCreate" => %{"success" => true, "comment" => %{"id" => "c1", "updatedAt" => "now"}}
+               }
+             }}
+        end
+      end)
+
+    assert response["success"]
+    assert Jason.decode!(response["output"])["operation"] == "created"
+    assert_received {:request, _context_query, %{issueId: "issue-1"}}
+    assert_received {:request, create_query, %{issueId: "issue-1", body: body}}
+    assert create_query =~ "SymphonyScopedWorkpadCreate"
+    assert body == "## Codex Workpad\n\nfrom file\n"
+  end
+
+  test "tracker_workpad_upsert file mode rejects unsafe paths, conflicts, and bad files" do
+    workspace = Path.join(System.tmp_dir!(), "symphony-workpad-file-bad-#{System.unique_integer([:positive])}")
+    outside = Path.join(System.tmp_dir!(), "symphony-workpad-outside-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(workspace)
+    File.mkdir_p!(outside)
+
+    on_exit(fn ->
+      File.rm_rf(workspace)
+      File.rm_rf(outside)
+    end)
+
+    File.write!(Path.join(workspace, "empty.md"), "")
+    File.write!(Path.join(workspace, "bad-header.md"), "ordinary text")
+    File.write!(Path.join(outside, "secret.md"), "## Codex Workpad\noutside")
+    File.ln_s!(Path.join(outside, "secret.md"), Path.join(workspace, "escape.md"))
+
+    must_not_call = fn _query, _variables, _opts -> flunk("invalid file input must not call Linear") end
+
+    invalid_cases = [
+      {%{"file_path" => "/absolute/path.md"}, workspace},
+      {%{"file_path" => "../escape.md"}, workspace},
+      {%{"file_path" => "escape.md"}, workspace},
+      {%{"file_path" => "missing.md"}, workspace},
+      {%{"file_path" => "empty.md"}, workspace},
+      {%{"file_path" => "bad-header.md"}, workspace},
+      {%{"file_path" => "workpad.md", "body" => "## Codex Workpad\ninline"}, workspace},
+      {%{"file_path" => "workpad.md"}, nil},
+      {%{"file_path" => String.duplicate("a", 300)}, workspace}
+    ]
+
+    Enum.each(invalid_cases, fn {arguments, ws} ->
+      response = scoped_call_file(arguments, ws, must_not_call)
+      refute response["success"]
+    end)
+  end
+
   defp scoped_call(tool, arguments, linear_client) do
     AgentTool.execute_scoped(tool, arguments,
       issue: @issue,
       tracker_settings: @tracker_settings,
+      linear_client: linear_client
+    )
+  end
+
+  defp scoped_call_file(arguments, workspace, linear_client) do
+    AgentTool.execute_scoped("tracker_workpad_upsert", arguments,
+      issue: @issue,
+      tracker_settings: @tracker_settings,
+      workspace: workspace,
       linear_client: linear_client
     )
   end

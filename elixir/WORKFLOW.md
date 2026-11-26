@@ -100,6 +100,7 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
 - Keep ticket metadata current (state, checklist, acceptance criteria, links).
 - Treat a single persistent Linear comment as the source of truth for progress.
 - Use that single workpad comment for all progress and handoff notes; do not post separate "done"/summary comments.
+- Maintain the workpad as a local `workpad.md` file in the workspace: edit it freely (zero tracker cost) and sync to the single workpad comment at milestones (plan finalized, implementation done, validation complete), not after every small change. On the Claude backend, sync with `tracker_workpad_upsert` using `file_path: "workpad.md"`; on Codex, use the `linear` skill's comment update with the file contents.
 - Treat any ticket-authored `Validation`, `Test Plan`, or `Testing` section as non-negotiable acceptance input: mirror it in the workpad and execute it before considering the work complete.
 - When meaningful out-of-scope improvements are discovered during execution,
   file a separate Linear issue instead of expanding scope. The follow-up issue

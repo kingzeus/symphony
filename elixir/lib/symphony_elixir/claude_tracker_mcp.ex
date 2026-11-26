@@ -23,6 +23,7 @@ defmodule SymphonyElixir.ClaudeTrackerMCP do
           issue: Issue.t() | map(),
           session_id: String.t(),
           turn_id: String.t(),
+          workspace: String.t() | nil,
           expires_at_ms: integer()
         }
 
@@ -40,6 +41,7 @@ defmodule SymphonyElixir.ClaudeTrackerMCP do
       when is_map(binding) and is_map(issue) and is_binary(session_id) and is_binary(turn_id) do
     server = Keyword.get(opts, :server, __MODULE__)
     ttl_ms = Keyword.get(opts, :ttl_ms, @default_ttl_ms)
+    workspace = Keyword.get(opts, :workspace)
 
     cond do
       not is_integer(ttl_ms) or ttl_ms <= 0 ->
@@ -49,7 +51,7 @@ defmodule SymphonyElixir.ClaudeTrackerMCP do
         {:error, :claude_tracker_mcp_has_no_tools}
 
       true ->
-        GenServer.call(server, {:open, binding, issue, session_id, turn_id, ttl_ms})
+        GenServer.call(server, {:open, binding, issue, session_id, turn_id, ttl_ms, workspace})
     end
   catch
     :exit, _reason -> {:error, :claude_tracker_mcp_unavailable}
@@ -103,7 +105,7 @@ defmodule SymphonyElixir.ClaudeTrackerMCP do
   def init(_opts), do: {:ok, %{capabilities: %{}}}
 
   @impl true
-  def handle_call({:open, binding, issue, session_id, turn_id, ttl_ms}, _from, state) do
+  def handle_call({:open, binding, issue, session_id, turn_id, ttl_ms, workspace}, _from, state) do
     token = Base.url_encode64(:crypto.strong_rand_bytes(32), padding: false)
     now_ms = System.monotonic_time(:millisecond)
 
@@ -112,6 +114,7 @@ defmodule SymphonyElixir.ClaudeTrackerMCP do
       issue: issue,
       session_id: session_id,
       turn_id: turn_id,
+      workspace: workspace,
       expires_at_ms: now_ms + ttl_ms
     }
 
@@ -165,7 +168,8 @@ defmodule SymphonyElixir.ClaudeTrackerMCP do
             capability.binding,
             name,
             arguments,
-            issue: capability.issue
+            issue: capability.issue,
+            workspace: capability.workspace
           )
 
         log_tool_result(capability, name, result)

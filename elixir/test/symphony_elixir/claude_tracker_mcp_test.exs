@@ -12,7 +12,7 @@ defmodule SymphonyElixir.ClaudeTrackerMCPTest do
     def execute_scoped_agent_tool("fake_tool", arguments, opts) do
       tracker_settings = Keyword.fetch!(opts, :tracker_settings)
       issue = Keyword.fetch!(opts, :issue)
-      send(tracker_settings.recipient, {:fake_tool, arguments, issue})
+      send(tracker_settings.recipient, {:fake_tool, arguments, issue, Keyword.get(opts, :workspace)})
 
       if Map.get(arguments, "ok", true) do
         %{"success" => true, "output" => Jason.encode!(%{"echo" => arguments})}
@@ -142,7 +142,7 @@ defmodule SymphonyElixir.ClaudeTrackerMCPTest do
 
     assert Jason.decode!(output) == %{"echo" => %{"value" => 7}}
     expected_issue = context.issue
-    assert_received {:fake_tool, %{"value" => 7}, ^expected_issue}
+    assert_received {:fake_tool, %{"value" => 7}, ^expected_issue, nil}
 
     assert {:ok, %{"result" => %{"isError" => true}}} =
              ClaudeTrackerMCP.handle_request(capability, %{
@@ -160,6 +160,25 @@ defmodule SymphonyElixir.ClaudeTrackerMCPTest do
 
     assert {:ok, %{"error" => %{"code" => -32_601}}} =
              ClaudeTrackerMCP.handle_request(capability, %{"jsonrpc" => "2.0", "id" => 8, "method" => "unknown"})
+  end
+
+  test "capability workspace is forwarded to scoped tool execution", context do
+    assert {:ok, token} =
+             ClaudeTrackerMCP.open(context.binding, context.issue, "session-ws", "turn-ws", workspace: "/tmp/issue-workspace")
+
+    assert {:ok, capability} = ClaudeTrackerMCP.lookup(token)
+    assert capability.workspace == "/tmp/issue-workspace"
+
+    assert {:ok, %{"result" => %{"isError" => false}}} =
+             ClaudeTrackerMCP.handle_request(capability, %{
+               "jsonrpc" => "2.0",
+               "id" => 1,
+               "method" => "tools/call",
+               "params" => %{"name" => "fake_tool", "arguments" => %{}}
+             })
+
+    expected_issue = context.issue
+    assert_received {:fake_tool, %{}, ^expected_issue, "/tmp/issue-workspace"}
   end
 
   test "JSON-RPC rejects malformed tool calls", context do

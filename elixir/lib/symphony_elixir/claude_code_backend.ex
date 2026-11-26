@@ -207,7 +207,8 @@ defmodule SymphonyElixir.ClaudeCodeBackend do
            issue,
            session_id,
            turn_id,
-           ttl_ms: settings.turn_timeout_ms + 60_000
+           ttl_ms: settings.turn_timeout_ms + 60_000,
+           workspace: session.workspace
          ) do
       {:ok, token} -> prepare_opened_tracker_mcp(settings, tool_specs, token)
       {:error, _reason} = error -> error

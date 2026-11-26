@@ -1353,6 +1353,10 @@ Prompt and process safety:
 - Host-managed error or blocked-report sections inside an agent-editable Workpad MUST survive scoped
   progress updates unchanged. The scoped tool SHOULD strip child-supplied copies and reattach only
   the existing host-authored section, preventing both silent history loss and forged host evidence.
+- A scoped Workpad upsert MAY accept the body from a local file as an alternative to an inline body,
+  so the agent can maintain the workpad as a workspace file and sync through a single tool at
+  milestones. A file source MUST be confined to the bound issue workspace: relative paths only, with
+  absolute paths, `..` traversal, and symlink escapes failing closed.
 - Local canonical paths MUST remain below the configured workspace root; root execution, outside
   paths, and symlink escapes fail closed.
 - Local cleanup SHOULD terminate the complete provider process tree with `TERM`, then `KILL` after

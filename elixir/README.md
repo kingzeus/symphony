@@ -330,6 +330,10 @@ claude_code:
   Host-managed `symphony:block-report` sections are immutable through this tool: agent-supplied
   copies are stripped and the existing host section is reattached unchanged, so later progress
   updates cannot silently erase or forge approval/error history.
+  `tracker_workpad_upsert` accepts the Workpad body either inline (`body`) or from a workspace file
+  (`file_path`, e.g. `workpad.md`): the agent maintains the workpad as a local file, edits it freely
+  at zero API cost, and syncs through this single tool at milestones. The file path must be relative
+  and resolve inside the bound issue workspace (absolute paths and symlink/`..` escapes fail closed).
   The MCP route suppresses dispatch parameter logging, with Phoenix parameter filters as defense in
   depth; operational logs retain only issue/session/turn/tool/success metadata.
 

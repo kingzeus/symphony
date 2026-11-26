@@ -4,6 +4,7 @@ defmodule SymphonyElixir.Linear.AgentTool do
   """
 
   alias SymphonyElixir.Linear.Client
+  alias SymphonyElixir.PathSafety
 
   @linear_graphql_tool "linear_graphql"
   @scoped_issue_get_tool "tracker_issue_get"
@@ -159,16 +160,24 @@ defmodule SymphonyElixir.Linear.AgentTool do
       },
       %{
         "name" => @scoped_workpad_upsert_tool,
-        "description" => "Create or update the single active Workpad on the current capability-bound Linear issue.",
+        "description" =>
+          "Create or update the single active Workpad on the current capability-bound Linear issue. " <>
+            "Provide either `body` inline or `file_path` to read the body from a local file in the issue workspace " <>
+            "(maintain the workpad as a local file and sync at milestones to keep context small).",
         "inputSchema" => %{
           "type" => "object",
           "additionalProperties" => false,
-          "required" => ["body"],
           "properties" => %{
             "body" => %{
               "type" => "string",
               "maxLength" => @max_workpad_body_bytes,
-              "description" => "Complete Workpad Markdown beginning with `## Codex 工作台` or `## Codex Workpad`."
+              "description" => "Complete Workpad Markdown beginning with `## Codex 工作台` or `## Codex Workpad`. Mutually exclusive with `file_path`."
+            },
+            "file_path" => %{
+              "type" => "string",
+              "description" =>
+                "Workspace-relative path to a local Markdown file whose contents become the Workpad body " <>
+                  "(e.g. `workpad.md`). Must stay inside the issue workspace. Mutually exclusive with `body`."
             }
           }
         }
@@ -232,8 +241,8 @@ defmodule SymphonyElixir.Linear.AgentTool do
     linear_client = Keyword.get(opts, :linear_client, &Client.graphql/3)
     client_opts = Keyword.take(opts, [:tracker_settings])
 
-    with :ok <- validate_argument_keys(arguments, ["body"]),
-         {:ok, body} <- normalize_workpad_body(arguments),
+    with :ok <- validate_argument_keys(arguments, ["body", "file_path"]),
+         {:ok, body} <- normalize_workpad_body(arguments, opts),
          {:ok, issue_id} <- scoped_issue_id(opts),
          {:ok, context_response} <-
            linear_client.(@scoped_workpad_context_query, %{issueId: issue_id}, client_opts),
@@ -306,20 +315,71 @@ defmodule SymphonyElixir.Linear.AgentTool do
 
   defp decode_scoped_issue(_response, _issue_id), do: {:error, :linear_unknown_payload}
 
-  defp normalize_workpad_body(arguments) do
-    case Map.get(arguments, "body") || Map.get(arguments, :body) do
-      body when is_binary(body) ->
-        trimmed_body = String.trim(body)
+  defp normalize_workpad_body(arguments, opts) do
+    with {:ok, raw_body} <- workpad_body_source(arguments, opts) do
+      validate_workpad_body(raw_body)
+    end
+  end
 
-        cond do
-          trimmed_body == "" -> {:error, :invalid_workpad_body}
-          byte_size(body) > @max_workpad_body_bytes -> {:error, :workpad_body_too_large}
-          not workpad_body?(trimmed_body) -> {:error, :invalid_workpad_header}
-          true -> {:ok, trimmed_body <> "\n"}
+  defp workpad_body_source(arguments, opts) do
+    body = Map.get(arguments, "body") || Map.get(arguments, :body)
+    file_path = Map.get(arguments, "file_path") || Map.get(arguments, :file_path)
+
+    cond do
+      is_binary(file_path) and file_path != "" ->
+        if is_binary(body) and body != "" do
+          {:error, :workpad_body_and_file_path}
+        else
+          read_workpad_file(file_path, Keyword.get(opts, :workspace))
         end
 
-      _other ->
+      is_binary(body) ->
+        {:ok, body}
+
+      true ->
         {:error, :invalid_workpad_body}
+    end
+  end
+
+  defp read_workpad_file(file_path, workspace) when is_binary(workspace) and workspace != "" do
+    if String.starts_with?(file_path, "/") do
+      {:error, :workpad_file_absolute_path}
+    else
+      candidate = Path.join(workspace, file_path)
+
+      with {:ok, canonical_workspace} <- PathSafety.canonicalize(workspace),
+           {:ok, canonical_file} <- PathSafety.canonicalize(candidate) do
+        read_descendant_file(canonical_file, canonical_workspace)
+      else
+        {:error, reason} -> {:error, {:workpad_file_read, reason}}
+      end
+    end
+  end
+
+  defp read_workpad_file(_file_path, _workspace), do: {:error, :missing_scoped_workspace}
+
+  defp read_descendant_file(canonical_file, canonical_workspace) do
+    if descendant_path?(canonical_file, canonical_workspace) do
+      case File.read(canonical_file) do
+        {:ok, body} -> {:ok, body}
+        {:error, reason} -> {:error, {:workpad_file_read, reason}}
+      end
+    else
+      {:error, :workpad_file_outside_workspace}
+    end
+  end
+
+  defp descendant_path?(path, root),
+    do: String.starts_with?(path <> "/", root <> "/") and path != root
+
+  defp validate_workpad_body(body) when is_binary(body) do
+    trimmed_body = String.trim(body)
+
+    cond do
+      trimmed_body == "" -> {:error, :invalid_workpad_body}
+      byte_size(body) > @max_workpad_body_bytes -> {:error, :workpad_body_too_large}
+      not workpad_body?(trimmed_body) -> {:error, :invalid_workpad_header}
+      true -> {:ok, trimmed_body <> "\n"}
     end
   end
 
@@ -591,6 +651,49 @@ defmodule SymphonyElixir.Linear.AgentTool do
         "message" => "The Workpad body must begin with `## Codex 工作台` or `## Codex Workpad`."
       }
     }
+  end
+
+  defp scoped_tool_error_payload(:workpad_body_and_file_path) do
+    %{
+      "error" => %{
+        "message" => "`tracker_workpad_upsert` accepts either `body` or `file_path`, not both."
+      }
+    }
+  end
+
+  defp scoped_tool_error_payload(:workpad_file_absolute_path) do
+    %{
+      "error" => %{
+        "message" => "`tracker_workpad_upsert.file_path` must be relative to the issue workspace."
+      }
+    }
+  end
+
+  defp scoped_tool_error_payload(:workpad_file_outside_workspace) do
+    %{
+      "error" => %{
+        "message" => "`tracker_workpad_upsert.file_path` must stay inside the issue workspace."
+      }
+    }
+  end
+
+  defp scoped_tool_error_payload(:missing_scoped_workspace) do
+    %{
+      "error" => %{
+        "message" => "`tracker_workpad_upsert.file_path` requires a bound issue workspace; use `body` instead."
+      }
+    }
+  end
+
+  defp scoped_tool_error_payload({:workpad_file_read, reason}) do
+    detail =
+      if is_atom(reason) do
+        to_string(:file.format_error(reason))
+      else
+        inspect(reason)
+      end
+
+    %{"error" => %{"message" => "Cannot read the Workpad file: #{detail}."}}
   end
 
   defp scoped_tool_error_payload(:multiple_active_workpads) do
