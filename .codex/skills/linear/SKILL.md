@@ -151,7 +151,8 @@ query IssueDetails($id: String!) {
 ## Find the workpad comment
 
 The workpad is a single persistent Linear comment (see WORKFLOW.md). List the
-issue's comments and match the `## Codex Workpad` marker header; ignore resolved
+issue's comments and match the `## Codex Workpad` or `## Codex 工作台` marker
+header (Symphony's blocked-report fallback creates the latter); ignore resolved
 comments while searching.
 
 ```graphql
