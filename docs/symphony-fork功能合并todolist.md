@@ -55,6 +55,10 @@
 
 ### P1-2 workpad 文件式同步移植
 
+> 已完成:`943af48`(2026-11-26)。不照搬参考(Codex 动态工具层 raw GraphQL+显式 ID);
+> 给受限 MCP 既有单一 `tracker_workpad_upsert` 加 `file_path` 模式(与 body 互斥),
+> workspace 穿过 capability 链路,读盘限定 issue workspace(越界/symlink fail-closed)。
+
 - **来源**:odysseus0/symphony `e812909d` + `04902e34`(sync_workpad 动态工具,+87/-26)。
 - **问题**:workpad 同步靠手写 Linear mutation,调用碎、易错。
 - **做什么**:原实现在 Codex 动态工具层,不能直接 cherry-pick;把「文件式 workpad 同步」思路移植到受限 Linear Tracker MCP(Claude 路径),收敛为单一工具。
