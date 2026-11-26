@@ -43,6 +43,11 @@
 
 ### P1-1 Claude result 事件提取 rate_limits
 
+> 已完成:`c127c37`(2026-11-26)。与参考偏差:参考假设 `requests_limit/tokens_limit` 形状,
+> 实测 Claude CLI 2.1.325 真实形状是百分比窗口 `five_hour/seven_day/spend_limit`
+> (`used_percentage`/`resets_at`)。适配层规范化为本 fork 看板桶形状
+> (`limit_id`+`primary/secondary/credits`),payload 原样无损。
+
 - **来源**:philipdaquin/symphony-claude `2d8ae5f9` 中的 `extract_rate_limits`。
 - **问题**:本 fork `AgentServer.Event` 已有 `rate_limits` 字段,但 ClaudeCodeBackend 未从 result 事件填充。
 - **做什么**:解析 Claude result payload 的 `rate_limits`(requests/tokens 的 limit/remaining),填入既有事件字段。
