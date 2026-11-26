@@ -144,6 +144,23 @@ defmodule SymphonyElixir.AgentServerTest do
     assert AgentServer.backend_name(SymphonyElixir.Codex.AppServer) == :codex
   end
 
+  test "backend registry is data-driven and round-trips name↔module" do
+    names = AgentServer.backend_names()
+    assert :codex in names and :claude_code in names
+
+    for name <- names do
+      module = AgentServer.backend_module(name)
+      assert AgentServer.backend_module(Atom.to_string(name)) == module
+      assert AgentServer.backend_name(module) == name
+    end
+
+    assert_raise ArgumentError, fn -> AgentServer.backend_module("nope") end
+    assert_raise ArgumentError, fn -> AgentServer.backend_module(:nope) end
+
+    # Unregistered modules (e.g. runner test fakes) keep the :codex fallback.
+    assert AgentServer.backend_name(SomeUnknownBackend) == :codex
+  end
+
   test "legacy updates 统一映射 typed usage、error、approval 和兼容 fallback" do
     usage = Usage.delta(:turn, 1, 2, :typed_usage)
     error = Error.new(:provider, "typed error")

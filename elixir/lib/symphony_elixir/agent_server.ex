@@ -350,15 +350,44 @@ defmodule SymphonyElixir.AgentServer do
               {:ok, map()} | {:error, Error.t()}
   @callback stop_session(session()) :: :ok
 
-  @spec backend_module(:codex | :claude_code | String.t()) :: module()
-  def backend_module(:codex), do: SymphonyElixir.Codex.AppServer
-  def backend_module("codex"), do: SymphonyElixir.Codex.AppServer
-  def backend_module(:claude_code), do: SymphonyElixir.ClaudeCodeBackend
-  def backend_module("claude_code"), do: SymphonyElixir.ClaudeCodeBackend
+  @backends %{
+    codex: SymphonyElixir.Codex.AppServer,
+    claude_code: SymphonyElixir.ClaudeCodeBackend
+  }
+
+  @doc """
+  Registered backend names. Adding a provider is a matter of extending this
+  registry (plus its config schema); the contract and consumers stay unchanged.
+  """
+  @spec backend_names() :: [atom()]
+  def backend_names, do: Map.keys(@backends)
+
+  @spec backend_module(atom() | String.t()) :: module()
+  def backend_module(name) when is_atom(name) do
+    case Map.fetch(@backends, name) do
+      {:ok, module} -> module
+      :error -> raise ArgumentError, "unknown agent backend: #{inspect(name)}"
+    end
+  end
+
+  def backend_module(name) when is_binary(name) do
+    module =
+      Enum.find_value(@backends, fn {key, backend_module} ->
+        if Atom.to_string(key) == name, do: backend_module
+      end)
+
+    case module do
+      nil -> raise ArgumentError, "unknown agent backend: #{inspect(name)}"
+      module -> module
+    end
+  end
 
   @spec backend_name(module()) :: :codex | :claude_code
-  def backend_name(SymphonyElixir.ClaudeCodeBackend), do: :claude_code
-  def backend_name(_module), do: :codex
+  def backend_name(module) do
+    Enum.find_value(@backends, :codex, fn {name, backend_module} ->
+      if backend_module == module, do: name
+    end)
+  end
 
   @spec normalize_event(:codex | :claude_code, Event.t() | map()) :: Event.t()
   def normalize_event(_backend, %Event{} = event), do: event

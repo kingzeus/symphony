@@ -666,7 +666,9 @@ Validation checks:
 - `tracker.kind` is present and supported.
 - The selected adapter accepts `tracker.provider` after documented defaults and `$VAR`
   resolution.
-- `agent.backend` is one of the implementation-supported backends.
+- `agent.backend` is one of the implementation-supported backends. Backends are a data-driven
+  registry (name → module); adding a provider extends the registry and its config schema without
+  changing the shared backend contract or the normalized-event consumers.
 - Backend command fields are valid and non-empty when configured; built-in defaults provide
   `codex app-server` and `claude` when omitted.
 

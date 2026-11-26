@@ -127,10 +127,9 @@ defmodule SymphonyElixir.Config do
 
   @spec agent_backend() :: :codex | :claude_code
   def agent_backend do
-    case settings!().agent.backend do
-      "claude_code" -> :claude_code
-      _ -> :codex
-    end
+    String.to_existing_atom(settings!().agent.backend)
+  rescue
+    ArgumentError -> :codex
   end
 
   @spec agent_backend_module() :: module()
