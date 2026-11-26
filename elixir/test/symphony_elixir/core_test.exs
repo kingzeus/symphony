@@ -2114,7 +2114,7 @@ defmodule SymphonyElixir.CoreTest do
 
       expected_turn_sandbox_policy = %{
         "type" => "workspaceWrite",
-        "writableRoots" => [canonical_workspace],
+        "writableRoots" => [canonical_workspace, Path.join(canonical_workspace, ".git")],
         "readOnlyAccess" => %{"type" => "fullAccess"},
         "networkAccess" => false,
         "excludeTmpdirEnvVar" => false,
@@ -2334,9 +2334,15 @@ defmodule SymphonyElixir.CoreTest do
                end
              end)
 
+      {:ok, canonical_workspace} = SymphonyElixir.PathSafety.canonicalize(workspace)
+
       expected_turn_policy = %{
         "type" => "workspaceWrite",
-        "writableRoots" => [Path.expand(workspace), workspace_cache]
+        "writableRoots" => [
+          Path.expand(workspace),
+          workspace_cache,
+          Path.join(canonical_workspace, ".git")
+        ]
       }
 
       assert Enum.any?(lines, fn line ->

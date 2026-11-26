@@ -414,6 +414,22 @@ defmodule SymphonyElixir.AppServerTest do
 
         assert {:ok, _result} = AppServer.run(workspace, "Validate supported turn policy", issue)
 
+        expected_policy =
+          case configured_policy do
+            %{"type" => "workspaceWrite"} ->
+              {:ok, canonical_workspace} = SymphonyElixir.PathSafety.canonicalize(workspace)
+              roots = Map.get(configured_policy, "writableRoots", [])
+
+              Map.put(
+                configured_policy,
+                "writableRoots",
+                roots ++ [Path.join(canonical_workspace, ".git")]
+              )
+
+            other ->
+              other
+          end
+
         trace = File.read!(trace_file)
         lines = String.split(trace, "\n", trim: true)
 
@@ -424,7 +440,7 @@ defmodule SymphonyElixir.AppServerTest do
                    |> Jason.decode!()
                    |> then(fn payload ->
                      payload["method"] == "turn/start" &&
-                       get_in(payload, ["params", "sandboxPolicy"]) == configured_policy
+                       get_in(payload, ["params", "sandboxPolicy"]) == expected_policy
                    end)
                  else
                    false
@@ -1785,7 +1801,10 @@ defmodule SymphonyElixir.AppServerTest do
 
       expected_turn_policy = %{
         "type" => "workspaceWrite",
-        "writableRoots" => [canonical_remote_workspace],
+        "writableRoots" => [
+          canonical_remote_workspace,
+          Path.join(canonical_remote_workspace, ".git")
+        ],
         "readOnlyAccess" => %{"type" => "fullAccess"},
         "networkAccess" => false,
         "excludeTmpdirEnvVar" => false,

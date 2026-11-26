@@ -503,6 +503,10 @@ fields locally if they want stricter startup checks.
   - Default: implementation-defined.
 - `turn_sandbox_policy` (Codex `SandboxPolicy` value)
   - Default: implementation-defined.
+  - For `workspaceWrite` policies, implementations SHOULD append `<workspace>/.git` to
+    `writableRoots` (without duplication) when the issue workspace is known. Codex
+    workspace-write sandboxes protect `.git` by default, which otherwise blocks the
+    git commit/push/PR workflow.
 - `turn_timeout_ms` (integer)
   - Default: `3600000` (1 hour)
 - `read_timeout_ms` (integer)

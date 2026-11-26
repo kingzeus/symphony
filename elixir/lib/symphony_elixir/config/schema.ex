@@ -383,7 +383,7 @@ defmodule SymphonyElixir.Config.Schema do
   def resolve_turn_sandbox_policy(settings, workspace \\ nil) do
     case settings.codex.turn_sandbox_policy do
       %{} = policy ->
-        policy
+        with_git_writable_root(policy, workspace)
 
       _ ->
         workspace
@@ -398,7 +398,7 @@ defmodule SymphonyElixir.Config.Schema do
   def resolve_runtime_turn_sandbox_policy(settings, workspace \\ nil, opts \\ []) do
     case settings.codex.turn_sandbox_policy do
       %{} = policy ->
-        {:ok, policy}
+        {:ok, with_git_writable_root(policy, workspace)}
 
       _ ->
         workspace
@@ -639,13 +639,30 @@ defmodule SymphonyElixir.Config.Schema do
   defp default_turn_sandbox_policy(workspace) do
     %{
       "type" => "workspaceWrite",
-      "writableRoots" => [workspace],
+      "writableRoots" => [workspace, Path.join(workspace, ".git")],
       "readOnlyAccess" => %{"type" => "fullAccess"},
       "networkAccess" => false,
       "excludeTmpdirEnvVar" => false,
       "excludeSlashTmp" => false
     }
   end
+
+  # Codex workspace-write sandboxes protect `.git` by default, which silently
+  # breaks the git commit/push/PR workflow; an explicit writable root lifts that
+  # protection while keeping the rest of the sandbox.
+  defp with_git_writable_root(%{"type" => "workspaceWrite"} = policy, workspace)
+       when is_binary(workspace) and workspace != "" do
+    git_root = Path.join(workspace, ".git")
+    roots = Map.get(policy, "writableRoots", [])
+
+    if git_root in roots do
+      policy
+    else
+      Map.put(policy, "writableRoots", roots ++ [git_root])
+    end
+  end
+
+  defp with_git_writable_root(policy, _workspace), do: policy
 
   defp default_runtime_turn_sandbox_policy(workspace_root, opts) when is_binary(workspace_root) do
     if Keyword.get(opts, :remote, false) do

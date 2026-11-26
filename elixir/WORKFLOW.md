@@ -37,14 +37,20 @@ codex:
   command: codex --config shell_environment_policy.inherit=all --config 'model="gpt-5.5"' --config model_reasoning_effort=xhigh app-server
   approval_policy: never
   thread_sandbox: workspace-write
+  # Symphony appends <workspace>/.git to writableRoots: Codex workspace-write
+  # protects .git by default, which would block git commit/push/PR.
   turn_sandbox_policy:
     type: workspaceWrite
     networkAccess: true
 claude_code:
   command: claude
-  # bypassPermissions removes Claude's approval boundary. Use it only in a disposable,
+  # auto runs unattended with Claude's classifier reviewing actions (git/PR to
+  # the configured remote pass; force push and secret exfiltration are blocked).
+  # It requires a model/provider that supports the classifier; when unavailable
+  # the session falls back to manual and tool calls are denied. bypassPermissions
+  # removes the approval boundary entirely — use it only in a disposable,
   # strongly isolated worker with trusted code and least-privilege credentials.
-  permission_mode: default
+  permission_mode: auto
   include_partial_messages: true
 ---
 
