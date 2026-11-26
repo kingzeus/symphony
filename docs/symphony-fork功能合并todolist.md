@@ -72,6 +72,8 @@
 
 ### P3-1 tracker 错误分类合同
 
+> 已完成(2026-11-26,文档项):落 [Linear兼容tracker需求与技术框架.md](Linear兼容tracker需求与技术框架.md) §4.5 错误响应分类合同(七类→后端 HTTP/信封/分页响应→symphony client.ex 错误原子映射 + 验收清单)。实证 symphony 按 HTTP 状态/信封形状/分页字段分类,不解析自定义 category,故后端无需实现 category 协议字段,symphony 零改可消费。§9 加交叉引用。
+
 - **来源**:ahammer/crescendo 的可移植错误分类:`tracker_config / tracker_auth / tracker_transport / tracker_response / tracker_rate_limited / tracker_payload / tracker_pagination`。
 - **做什么**:这是给 dash 后端的合同参考,非 symphony 代码。落到 [Linear兼容tracker需求与技术框架.md](Linear兼容tracker需求与技术框架.md) 的深化稿,作为兼容后端错误 responses 的验收清单。
 - **验收**:后端错误分类与七类对齐;symphony 侧零改动可消费。

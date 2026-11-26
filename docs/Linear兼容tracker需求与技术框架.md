@@ -103,6 +103,30 @@ symphony 实际依赖面(证据:本仓库 `elixir/lib/symphony_elixir/linear/cli
 - 鉴权头为裸 key(`linear/client.ex` `graphql_headers`)。
 - 故复用 `linear` adapter、仅改配置即可,无需新增 Elixir。
 
+### 4.5 错误响应分类合同(后端验收清单)
+
+参考 ahammer/crescendo 的七类 tracker 错误分类。**symphony 侧零改动可消费**:symphony `linear/client.ex` 按后端的 HTTP 状态/GraphQL 信封/分页字段产出固定错误原子,orchestrator 统一 log + 下一 tick 重试(候选 fetch 跳过本 tick、running refresh 保持 worker)。后端只需按下表产出响应,symphony 即正确分类,无需新增 Elixir。
+
+| 分类 | 触发 | 后端响应要求 | symphony 消费(client.ex) |
+|---|---|---|---|
+| `tracker_config` | endpoint/api_key/project_slug/assignee 缺失或非法 | 无需后端处理 | symphony `adapter.validate_config` 请求前本地拒绝(`:invalid_linear_endpoint`/`:missing_linear_api_token`/`:missing_linear_project_slug`/`:invalid_linear_assignee`) |
+| `tracker_auth` | token 缺失/无效/过期 | **HTTP 401/403**(不要 200+errors) | `{:linear_api_status, 401/403}` |
+| `tracker_transport` | 连接超时/拒绝/DNS/网络中断 | 无需后端处理(传输层) | `{:linear_api_request, reason}` |
+| `tracker_response` | 服务端错误(5xx)、其它 4xx | **HTTP 非 200 状态码**(不要 200 吞错) | `{:linear_api_status, status}` |
+| `tracker_rate_limited` | 限流 | **HTTP 429**(可选 `Retry-After`) | `{:linear_api_status, 429}` |
+| `tracker_payload` | HTTP 200 但信封 malformed/未知 | 始终返回合法 GraphQL 信封:`{data:...}` 或 `{errors:[{message:...}]}`;errors 必须是**对象数组**,不可裸字符串/缺 message | 缺 data/errors → `:linear_unknown_payload`;`{errors:[...]}` → `{:linear_graphql_errors, errors}` |
+| `tracker_pagination` | `hasNextPage=true` 但 cursor 缺失/空 | `pageInfo.hasNextPage=true` **必须**配非空 `endCursor` | `:linear_missing_end_cursor` |
+
+**验收要点**(后端实现逐项核对):
+1. 鉴权失败用 HTTP 401/403,不要用 200+errors 表达(否则 symphony 归为 payload 类而非 auth)。
+2. 限流用 HTTP 429,与服务端错误(5xx)区分,便于退避语义。
+3. 任何错误都不要返回 200 空体/非 JSON:200 必须带 `{data}` 或 `{errors}` 之一,否则 `:linear_unknown_payload`。
+4. GraphQL `errors` 是 `[{message: String, ...}]` 对象数组(message 必备),symphony 据此 summarise 日志。
+5. 分页 `hasNextPage=true` 必配非空 `endCursor`;末页 `hasNextPage=false`(cursor 可空)。
+6. 字段类型/形状遵 §4.1–4.3(priority int、时间 RFC3339、state{name,type});形状错配会落 `tracker_payload`。
+
+**设计依据**:symphony 不解析后端自定义 error code/category,仅按 HTTP 状态 + 信封形状 + 分页字段分类。故后端**无需**实现 crescendo 的 category 字段本身,只需产出能映射到上述七类的响应。category 是验收视角,不是线上协议字段。
+
 ## 5. 数据模型(草图)
 
 表少、最新行即当前态、位置派生不存、不预留无来源字段。约 7 表,均继承 `BaseModel`(created_at/updated_at/state 软删):
@@ -207,6 +231,7 @@ tracker:
 - filter 嵌套输入形状(`project.slugId.eq` / `state.name.in` / `id.in`)必须逐字匹配 —— 模拟最 fiddly 处。
 - 内省由 graphql-core 免费提供,保留即可;skill 已预置全部操作形状,不依赖内省。
 - 字段类型 / 分页 cursor 需要正确,adapter 跟随 cursor。
+- 错误响应分类遵 §4.5 验收清单(七类映射 HTTP 状态/信封/分页);symphony 零改可消费,后端无需实现 category 协议字段。
 - 并发写:多 agent 同时 `issueUpdate` / workpad upsert → 行锁 / 幂等。
 - 纪律:只实现读核 + 这几个 mutation,**不建全 Linear schema**(SPEC §11)。
 
