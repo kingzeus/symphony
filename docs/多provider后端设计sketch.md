@@ -3,7 +3,7 @@
 > 状态:设计 sketch v0.2(待评审深化,2026-11-26)。范围:**kingzeus/symphony fork** 的执行后端扩展。
 > 核心方向(操作者定):**先抽象一个 provider 无关的通用层**,后续加 provider 是薄适配,不推倒重来。首批 provider = **Qoder CLI**。
 > 参考:Multica(`multica-ai/multica`)Backend 抽象;philipdaquin/symphony-claude 的 Agent.Behaviour;Swiftyos/OpenSymphony 的多后端路由。
-> 关联:[Symphony与Multica视角差异](../../docs/Symphony与Multica视角差异.md)、[symphony-fork功能合并todolist](symphony-fork功能合并todolist.md)、[Linear兼容tracker需求与技术框架](Linear兼容tracker需求与技术框架.md)。
+> 关联:[Symphony与Multica视角差异](../../docs/Symphony与Multica视角差异.md)、[symphony-fork功能合并todolist](symphony-fork功能合并todolist.md)、[Linear兼容tracker需求与技术框架](../../docs/Linear兼容tracker需求与技术框架.md)(父仓)。
 
 ## 1. 背景与目标
 
